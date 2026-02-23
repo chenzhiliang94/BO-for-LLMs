@@ -272,11 +272,11 @@ def extract_data_mixture_and_train_and_evaluate(input_X, evaluation_task, model,
         sampled_train_data = sampled_train_data.shuffle(seed=seed).map(tokenizing_method[data_domain], fn_kwargs={"tokenizer": tokenizer,
                                                                                    "add_eos_token": add_eos_token,
                                                                                    "train_on_inputs": train_on_inputs,
-                                                                                   }, keep_in_memory=False)
+                                                                                   }, keep_in_memory=True)
         sampled_val_data = sampled_val_data.shuffle(seed=seed).map(tokenizing_method[data_domain], fn_kwargs={"tokenizer": tokenizer,
                                                                                    "add_eos_token": add_eos_token,
                                                                                    "train_on_inputs": train_on_inputs,
-                                                                                   }, keep_in_memory=False)
+                                                                                   }, keep_in_memory=True)
         # print("done mapping!")
         
         # drop columns
@@ -614,73 +614,73 @@ def evaluate_tasks(tasks : List[str], model, tokenizer, batch=1, few_shot=1, lim
             task_manager=lm_eval.tasks.TaskManager(),batch_size=batch,max_batch_size=batch, num_fewshot=few_shot)
     return results
 
-def load_data(data_domain):
+def load_data(data_domain, data_cache_dir):
         # Load the dataset
     print(data_domain)
     if data_domain == "headqa_en":
         data_domain = "headqa"
     if data_domain == "wikitext":
-        dataset = datasets.load_dataset(data_domain, "wikitext-2-v1", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset(data_domain, "wikitext-2-v1", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "triviaqa":
-        dataset = datasets.load_dataset("mandarjoshi/trivia_qa", "rc", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("mandarjoshi/trivia_qa", "rc", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "pubmedqa":
-        dataset = datasets.load_dataset("bigbio/pubmed_qa", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("bigbio/pubmed_qa", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "truthfulqa_gen":
-        dataset = datasets.load_dataset("truthfulqa/truthful_qa", "generation", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("truthfulqa/truthful_qa", "generation", cache_dir = data_cache_dir)
         train_dataset = dataset["validation"]
         val_dataset = dataset["validation"]
     elif data_domain == "commonsense_qa":
-        dataset = datasets.load_dataset("tau/commonsense_qa", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("tau/commonsense_qa", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "rowan_hellaswag":
-        dataset = datasets.load_dataset("Rowan/hellaswag", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("Rowan/hellaswag", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "sciq":
-        dataset = datasets.load_dataset("allenai/sciq", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("allenai/sciq", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "gsm8k":
-        dataset = datasets.load_dataset("openai/gsm8k", "main", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("openai/gsm8k", "main", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["test"]
     elif data_domain == "squadv2":
-        dataset = datasets.load_dataset("rajpurkar/squad_v2" , cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("rajpurkar/squad_v2" , cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "headqa":
-        dataset = datasets.load_dataset("dvilares/head_qa", "en", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("dvilares/head_qa", "en", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "datologyai_hellaswag":
-        dataset = datasets.load_dataset("DatologyAI/hellaswag", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("DatologyAI/hellaswag", cache_dir = data_cache_dir)
         train_dataset = dataset["eval"]
         val_dataset = dataset["eval"]
     elif data_domain == "mmlu":
-        dataset = datasets.load_dataset("cais/mmlu", "all", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("cais/mmlu", "all", cache_dir = data_cache_dir)
         train_dataset = dataset["test"]
         val_dataset = dataset["validation"]
     elif data_domain == "arc_challenge":
-        dataset = datasets.load_dataset("allenai/ai2_arc", "ARC-Challenge", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("allenai/ai2_arc", "ARC-Challenge", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "winogrande":
-        dataset = datasets.load_dataset("allenai/winogrande", "winogrande_xl", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("allenai/winogrande", "winogrande_xl", cache_dir = data_cache_dir)
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
     elif data_domain == "minervamath":
-        dataset = datasets.load_dataset("math-ai/minervamath", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("math-ai/minervamath", cache_dir = data_cache_dir)
         train_dataset = dataset["test"]
         val_dataset = dataset["test"]
     elif data_domain == "humaneval":
-        dataset = datasets.load_dataset("openai/openai_humaneval", cache_dir = "/home/chenzhil/maplecg_nfs/Data-Mixing/datasets")
+        dataset = datasets.load_dataset("openai/openai_humaneval", cache_dir = data_cache_dir)
         train_dataset = dataset["test"]
         val_dataset = dataset["test"]
     else:

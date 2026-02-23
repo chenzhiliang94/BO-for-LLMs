@@ -18,7 +18,8 @@ RUN_BO_ON=data
 TRAIN_BATCH=8
 EVAL_BATCH=8
 MODEL=llama-8b
-OUTPUT_DIR=/home/chenzhil/results/
+OUTPUT_DIR=results
+PRINTOUT_DIR=printouts
 USE_JOBS=0
 UCB_BETA=20
 
@@ -26,10 +27,11 @@ UCB_BETA=20
 # Sweep variables
 # ----------------------- #
 
-OPT_METHODS=("multi_fidelity" "multi_fidelity_KG" "mixed" "random")
+OPT_METHODS=("random" "multi_fidelity" "multi_fidelity_KG" "mixed")
 ACQ_FUNCS=("ucb" "EI")
 EVAL_METHODS=("eval_loss" "performance")
 
+# evaluation tasks
 TASKS=("arc_challenge")
 
 # Track failures
@@ -46,17 +48,17 @@ run_job() {
     local eval_method=$4
     local seed=13549
 
-    INFO_PRINTOUT="unitTest_opt_${opt_method}_acq_${acq_func}_eval_${eval_method}"
+    INFO_PRINTOUT="_${opt_method}_acq_${acq_func}_eval_${eval_method}"
     SAVE_NAME="${MODEL}_${acq_func}_${task}_${INFO_PRINTOUT}.json"
-    LOG_FILE="/home/chenzhil/printout/${MODEL}_${acq_func}_${task}_${INFO_PRINTOUT}.out"
+    LOG_FILE="${PRINTOUT_DIR}/${MODEL}_${acq_func}_${task}_${INFO_PRINTOUT}.out"
 
     echo "==============================================="
     echo "TASK=$task"
     echo "OPT_METHOD=$opt_method"
     echo "ACQ_FUNC=$acq_func"
     echo "EVAL_METHOD=$eval_method"
-    echo "OUTPUT AT /home/chenzhil/printout/${MODEL}_${ACQ_FUNC}_${task}_${INFO_PRINTOUT}.out"
-    echo "RESULTS WILL BE SAVED AT ${MODEL}_${ACQ_FUNC}_${task}_${INFO_PRINTOUT}.json"
+    echo "OUTPUT AT ${LOG_FILE}"
+    echo "RESULTS WILL BE SAVED AT ${OUTPUT_DIR}/${SAVE_NAME}"
     echo "==============================================="
 
     python3 -u BO_runs_LLM_joint_optimization.py \

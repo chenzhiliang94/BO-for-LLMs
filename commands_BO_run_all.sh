@@ -19,16 +19,6 @@ EVAL_BATCH=8
 EVAL_METHOD=eval_loss # IMPORTANT. eval_loss or performance (either take loss or performance)
 MODEL=llama-8b # IMPORTANT
 
-# use the following model options:
-# if model == "llama-8b":
-#     model_id="meta-llama/Meta-Llama-3-8B-Instruct"
-# elif model == "qwen-7b":
-#     model_id="Qwen/Qwen2.5-7B-Instruct"
-# elif model == "qwen-14b":
-#     model_id="Qwen/Qwen3-14B"
-# elif model == "qwen-32b":
-#     model_id="Qwen/Qwen3-32B"
-
 UCB_BETA=20
 OPT_METHOD=multi_fidelity
 

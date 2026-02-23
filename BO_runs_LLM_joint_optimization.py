@@ -1,52 +1,54 @@
 import random
-import string
-from BO import joint_opt_BO_LLM_generalized, collect_results_for_random_configs
+from BO import joint_opt_BO_LLM_generalized
 import torch
 
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    get_peft_model_state_dict,
-    prepare_model_for_kbit_training ,
-    set_peft_model_state_dict,
-)
+from peft import LoraConfig
 
 from argparse import ArgumentParser
 from transformers import TrainerCallback
 import time
 import os
 
-run_name = "BO_runs_LLM_joint_optimization"
 parser = ArgumentParser()
 
-parser.add_argument("--iterations", help="iterations BO?", type=int, default=10)
-parser.add_argument("--num_data", help="total_data?", type=int, default=10000)
-parser.add_argument("--epochs", help="epochs", default=1)
-parser.add_argument("--trials", help="trials", default=1)
-parser.add_argument("--evaluation_cuda", help="evaluation_cuda", default=0)
-parser.add_argument("--eval_tasks", help="eval_tasks") # see task_metrics for different tasks
-parser.add_argument("--eval_method", help="eval_method")
-parser.add_argument("--experiments_setting", help="either ood or in_dist")
-parser.add_argument("--time_limit", help="time_limit")
-parser.add_argument("--lora_rank", help="max lora_rank")
+# =========================
+# Experiment configuration
+# =========================
 parser.add_argument("--model", help="model name or path")
-parser.add_argument("--JoBS", help="whether to apply scaling law", type=int, default=False)
-parser.add_argument("--run_BO_on", help="whether to run BO on model, data, or both", default="data")
-parser.add_argument("--output_dir", help="output_dir for results json file")
-
-# BO stuff hyperparams
-parser.add_argument("--acq_function", help="acquisition function")
-parser.add_argument("--ucb_beta", help="lora_rank", default=10.0)
-parser.add_argument("--optimize_method", help="optimize_method")
-
-parser.add_argument("--save_name", help="save_name")
+parser.add_argument("--experiments_setting", help="either ood or in_dist")
 parser.add_argument("--seed", help="seed value for single eval", type=int)
-parser.add_argument("--limit", help="no. of samples for performance evaluation. Default is 100", default=100)
-parser.add_argument("--training_batch", help="training_batch", type=int)
-parser.add_argument("--evaluation_batch", help="evaluation_batch", type=int)
+parser.add_argument("--output_dir", help="output_dir for results json file")
+parser.add_argument("--save_name", help="save_name")
+parser.add_argument("--data_cache_dir", help="cache dir for loading datasets", default="./dataset_cache")
 
-# deepspeed
-parser.add_argument("--local_rank", type=int, default=0)
+# =========================
+# Training configuration
+# =========================
+parser.add_argument("--num_data", help="total training data size", type=int, default=10000)
+parser.add_argument("--epochs", help="number of training epochs", type=int, default=1)
+parser.add_argument("--training_batch", help="training batch size", type=int)
+parser.add_argument("--lora_rank", help="maximum LoRA rank", type=int)
+parser.add_argument("--time_limit", help="training time limit")
+parser.add_argument("--JoBS", help="whether to apply scaling law", type=int, default=0)
+
+# =========================
+# Evaluation configuration
+# =========================
+parser.add_argument("--eval_tasks", help="evaluation tasks") # comma separated list of evaluation tasks, e.g. "commonsense_qa,gsm8k"
+parser.add_argument("--eval_method", help="evaluation method") # eval_loss or performance
+parser.add_argument("--evaluation_batch", help="evaluation batch size", type=int) # batch size for evaluation
+parser.add_argument("--evaluation_cuda", help="evaluation cuda device", default=0) # cuda to load evaluation LLM
+parser.add_argument("--limit", help="number of samples for evaluation", type=int, default=100) # number of samples to evaluate downstream performance
+parser.add_argument("--trials", help="number of evaluation trials", type=int, default=1) # trials to repeat entire experiment (with different random seeds)
+
+# =========================
+# Bayesian Optimization
+# =========================
+parser.add_argument("--run_BO_on", help="optimize over model, data, or both", default="data")
+parser.add_argument("--optimize_method", help="BO optimization method")
+parser.add_argument("--acq_function", help="acquisition function")
+parser.add_argument("--ucb_beta", help="UCB beta parameter", type=float, default=10.0)
+parser.add_argument("--iterations", help="number of BO iterations", type=int, default=50)
 
 # random configs
 parser.add_argument("--eval_random_config", help="if specified, evaluate random configs", action="store_true")
@@ -92,13 +94,14 @@ cuda=int(args["evaluation_cuda"])
 cuda="cuda:"+str(cuda)
 BO_run = int(args["iterations"])
 total_data = int(args["num_data"])
-tasks = str(args["eval_tasks"]).split(",") # list of eval task
+tasks = str(args["eval_tasks"]).split(",")
 evaluation_weights = [1/len(tasks)] * len(tasks)
 lora_rank =int(args["lora_rank"])
 ucb_beta = float(args["ucb_beta"])
-run_BO_on = str(args["run_BO_on"]) # either "model" or "data"
-limit = int(args["limit"]) # either "model" or "data" or "all"
+run_BO_on = str(args["run_BO_on"])
+limit = int(args["limit"])
 save_name = str(args["save_name"])
+data_cache_dir = str(args["data_cache_dir"])
 
 is_random_config = bool(args["eval_random_config"])
 num_random_configs = int(args["num_random_configs"])
@@ -190,20 +193,6 @@ for x in range(trials):
             bias="none",
             task_type="CAUSAL_LM",)
     
-    if is_random_config:
-        print("collecting results for random configs for task: ", evaluation_task)
-        GP_input, observed_output = collect_results_for_random_configs(lora_rank_max=lora_rank,
-                                                        data_domains=data_domains,
-                                                        num_random_configs=num_random_configs,
-                                                        total_data=total_data,
-                                                        evaluation_task=evaluation_task,
-                                                        eval_method=eval_method,
-                                                        model_id=model_id,
-                                                        sampling_method=sample_method,
-                                                        train_epochs=train_epochs,
-                                                        eval_steps=evaluation_steps,
-                                                        training_batch=training_batch,
-                                                        seed=seed)
     print("running BO on both data and model")
 
     if model == "llama-8b":
@@ -233,7 +222,8 @@ for x in range(trials):
                                                                 limit=limit,
                                                                 seed=seed,
                                                                 model_id=model_id,
-                                                                what_to_optimize=run_BO_on)
+                                                                what_to_optimize=run_BO_on,
+                                                                data_cache_dir=data_cache_dir)
 
     current_max = float('-inf')  # Start with negative infinity
     max_until_now = []           # List to store max values at each step
