@@ -1,0 +1,106 @@
+#!/bin/bash
+export TQDM_DISABLE=1
+export CUDA_VISIBLE_DEVICES=0
+
+# ----------------------- #
+# Shared configuration
+# ----------------------- #
+ITER=5
+NUM_DATA=10000
+EPOCHS=1
+TRIALS=2
+EXP_SETTING=in_dist # ood or in_dist
+TIME_LIMIT=30 # usually this is not a limiting factor because we will finish 1 epoch
+LORA_RANK=128
+LIMIT=100 # how many datapoints to evaluation in llm-harness. 0 means all points.
+RUN_BO_ON=data # model, data, or both
+TRAIN_BATCH=8
+EVAL_BATCH=8
+EVAL_METHOD=eval_loss # IMPORTANT. eval_loss or performance (either take loss or performance)
+MODEL=llama-8b # IMPORTANT
+
+# use the following model options:
+# if model == "llama-8b":
+#     model_id="meta-llama/Meta-Llama-3-8B-Instruct"
+# elif model == "qwen-7b":
+#     model_id="Qwen/Qwen2.5-7B-Instruct"
+# elif model == "qwen-14b":
+#     model_id="Qwen/Qwen3-14B"
+# elif model == "qwen-32b":
+#     model_id="Qwen/Qwen3-32B"
+
+UCB_BETA=20
+OPT_METHOD=multi_fidelity
+
+# multi_fidelity
+# multi_fidelity_KG
+# mixed
+# random
+
+OUTPUT_DIR=/home/chenzhil/results/
+USE_JOBS=0 # whether to use a performance predictor 0 or 1. If 1, make sure is mixed. Probably want to add a new arg for number of training points.
+INFO_PRINTOUT=run_BO_on_${RUN_BO_ON}_evaluate_on_${EVAL_METHOD}_${EXP_SETTING}_use_JoBS_${USE_JOBS} # additional info to identify the experiment. Only affects the output file name.
+ACQ_FUNC=ucb # EI or ucb
+
+# ----------------------- #
+# Task groups
+# ----------------------- #
+
+# group1=("arc_challenge" "triviaqa" "mmlu" "commonsense_qa" "truthfulqa_gen" "gsm8k" "mmlu")
+group1=("arc_challenge")
+
+echo "${group1[@]}"
+# ----------------------- #
+# Function to run a job
+# ----------------------- #
+run_task() {
+    local task=$1
+    local seed=13549
+    echo "TRAIN_BATCH=$TRAIN_BATCH"
+    echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "EVAL_METHOD=$EVAL_METHOD"
+    echo "MODEL=$MODEL"
+    echo "JoBS=$USE_JOBS"
+    echo "ACQ=$ACQ_FUNC"
+    echo "INFO=$INFO_PRINTOUT"
+    echo "OPT_METHOD=$OPT_METHOD"
+    echo "OUTPUT AT /home/chenzhil/printout/${MODEL}_${ACQ_FUNC}_${task}_${INFO_PRINTOUT}.out"
+    echo "RESULTS WILL BE SAVED AT ${MODEL}_${ACQ_FUNC}_${task}_${INFO_PRINTOUT}.json"
+
+    nohup python3 -u BO_runs_LLM_joint_optimization.py \
+        --iterations=$ITER \
+        --num_data=$NUM_DATA \
+        --epochs=$EPOCHS \
+        --trials=$TRIALS \
+        --eval_tasks=$task \
+        --experiments_setting=$EXP_SETTING \
+        --time_limit=$TIME_LIMIT \
+        --lora_rank=$LORA_RANK \
+        --limit=$LIMIT \
+        --run_BO_on=$RUN_BO_ON \
+        --training_batch=$TRAIN_BATCH \
+        --evaluation_batch=$EVAL_BATCH \
+        --eval_method=$EVAL_METHOD \
+        --seed=$seed \
+        --acq_function=$ACQ_FUNC \
+        --model=$MODEL \
+        --JoBS=$USE_JOBS \
+        --ucb_beta=$UCB_BETA \
+        --optimize_method=$OPT_METHOD \
+        --output_dir=$OUTPUT_DIR \
+        --save_name="${MODEL}_${ACQ_FUNC}_${task}_${INFO_PRINTOUT}.json" \
+        > "/home/chenzhil/printout/${MODEL}_${ACQ_FUNC}_${task}_${INFO_PRINTOUT}.out" 2>&1
+
+    echo "DONE FOR THIS TASK: $task"
+    echo "-----------------------------------"
+}
+
+# ----------------------- #
+# Run all task in group
+# ----------------------- #
+for task in "${group1[@]}"; do
+    echo "Running task in sequence: $task"
+    run_task "$task"
+done
+
+wait
