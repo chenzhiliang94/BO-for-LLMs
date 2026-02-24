@@ -327,21 +327,6 @@ def arrange_lora_config(lora_r, lora_dropout, num_layers_to_apply, five_dim_vect
     task_type="CAUSAL_LM",)
 
     return config
-    '''
-    model.layers.0.self_attn
-    model.layers.0.self_attn.q_proj
-    model.layers.0.self_attn.k_proj
-    model.layers.0.self_attn.v_proj
-    model.layers.0.self_attn.o_proj
-    model.layers.0.self_attn.rotary_emb
-    model.layers.0.mlp
-    model.layers.0.mlp.gate_proj
-    model.layers.0.mlp.up_proj
-    model.layers.0.mlp.down_proj
-    model.layers.0.mlp.act_fn
-    model.layers.0.input_layernorm
-    model.layers.0.post_attention_layernorm
-    '''
 
 # -------------------------
     # Candidate processing
@@ -574,15 +559,15 @@ def get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_
     return lora_config, mixing_ratio, discrete_dims
 
 # evaluate performance at the end of full-training.
-def evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, limit):
+def evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, num_eval_samples):
     model.eval()
     observed_performance = None # what is observed, possibly low-fidelity.
     realized_performance = None # performance at the end of training. Potentially the same as observed_performance.
     if eval_method == "performance":
         print("evaluating with task performance...")
-        if limit == 0:
-            limit = None
-        results = evaluate_tasks(list(evaluation_task.keys()), model, tokenizer, evaluation_batch, few_shot=5, limit=limit)
+        if num_eval_samples == 0:
+            num_eval_samples = None
+        results = evaluate_tasks(list(evaluation_task.keys()), model, tokenizer, evaluation_batch, few_shot=5, limit=num_eval_samples)
         perf = 0
         for task, (weight, metric) in evaluation_task.items():
             p = results["results"][task][metric]
@@ -763,7 +748,7 @@ def joint_opt_BO_LLM_generalized(
         lora_rank_max: int,
         data_domains: list,
         BO_run: int,
-        total_data: int,
+        total_number_datapoints: int,
         evaluation_task: dict,
         eval_method: str,
         BO_params : dict,
@@ -774,7 +759,7 @@ def joint_opt_BO_LLM_generalized(
         evaluation_batch: int = 4,
         max_steps=-1,
         eval_steps=100,
-        limit=100,
+        num_eval_samples=100,
         seed=42,
         what_to_optimize : str = "both",
         data_cache_dir : str = "./dataset_cache"):
@@ -815,15 +800,13 @@ def joint_opt_BO_LLM_generalized(
             _ , val_dataset = load_data(data_domain=domain, data_cache_dir=data_cache_dir)
             evaluation_datasets_and_weights.append((val_dataset, domain, evaluation_task[domain][0])) # 0-th index is weight
         all_sampled_evaluation_data = [] # same distribution as training data, but validation
-        evaluation_datasets_and_weights
-        print("evaluation dataset:")
         for eval_data, data_domain, weight in evaluation_datasets_and_weights:
             print("data domain: ", data_domain, " weight: ", weight)
-            sampled_val_data = sample(eval_data, int(total_data * weight/10), additional_info=None, method="random", data_domain=data_domain, seed=seed)
+            sampled_val_data = sample(eval_data, int(total_number_datapoints * weight/10), additional_info=None, method="random", data_domain=data_domain, seed=seed)
             sampled_val_data = sampled_val_data.shuffle(seed=seed).map(tokenizing_method[data_domain], fn_kwargs={"tokenizer": tokenizer,
                                                                                 "add_eos_token": add_eos_token,
                                                                                 "train_on_inputs": train_on_inputs,
-                                                                                }, keep_in_memory=False)
+                                                                                }, keep_in_memory=True)
             sampled_val_data = sampled_val_data.select_columns(['input_ids', 'attention_mask', 'labels'])
             all_sampled_evaluation_data.append(sampled_val_data)
         all_sampled_evaluation_data = concatenate_datasets(all_sampled_evaluation_data)
@@ -1006,7 +989,11 @@ def joint_opt_BO_LLM_generalized(
             candidate[0][-9:-4] = torch.tensor([0, 0, 0, 0, 1], dtype=candidate[0].dtype)
         
         input_X_between_0_1 = list(candidate[0])
-        input_X = process_candidate(candidate[0])
+        if what_to_optimize != "data":
+            input_X = process_candidate(candidate[0], what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max)
+        else:
+            input_X = input_X_between_0_1
+
         print("input_X after fitting GP with prior data:", input_X)
         print("input_X_between_0_1 after fitting GP with prior data:", input_X_between_0_1)
         print("fidelity:", fidelity)
@@ -1073,7 +1060,7 @@ def joint_opt_BO_LLM_generalized(
                     # Get performance from lm_eval
                     print(f"Running evaluation for step {current_step}...")
                     model.eval()
-                    results = evaluate_tasks(list(self.eval_tasks.keys()), model, self.tokenizer, batch=8, few_shot=3, limit=100)
+                    results = evaluate_tasks(list(self.eval_tasks.keys()), model, self.tokenizer, batch=8, few_shot=3, limit=num_eval_samples)
                     model.train()
                     
                     # Extract the specific metric value
@@ -1111,7 +1098,7 @@ def joint_opt_BO_LLM_generalized(
             evaluation_dataset=all_sampled_evaluation_data, # evaluation data
             mixing_ratio=mixing_ratio,
             additional_info=all_influences,
-            total_number_datapoints=total_data,
+            total_number_datapoints=total_number_datapoints,
             method=sampling_method,
             train_epochs=train_epochs,
             batch_size=training_batch,
@@ -1122,7 +1109,7 @@ def joint_opt_BO_LLM_generalized(
             seed=seed
         )
 
-        observed_performance, realized_performance = evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, limit)
+        observed_performance, realized_performance = evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, num_eval_samples)
             
         # transform observed_performance (or eval_loss_trajectory) into a new observed_performance
         # with some variant of a predictor/extrapolator
@@ -1197,7 +1184,7 @@ def joint_opt_BO_LLM_generalized(
         
         input_X_between_0_1 = list(candidate[0])
         if what_to_optimize != "data":
-            input_X = process_candidate(candidate[0])
+            input_X = process_candidate(candidate[0], what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max)
         else:
             input_X = input_X_between_0_1
         fidelity = next_fidelity

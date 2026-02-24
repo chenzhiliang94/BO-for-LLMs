@@ -38,7 +38,7 @@ parser.add_argument("--eval_tasks", help="evaluation tasks") # comma separated l
 parser.add_argument("--eval_method", help="evaluation method") # eval_loss or performance
 parser.add_argument("--evaluation_batch", help="evaluation batch size", type=int) # batch size for evaluation
 parser.add_argument("--evaluation_cuda", help="evaluation cuda device", default=0) # cuda to load evaluation LLM
-parser.add_argument("--limit", help="number of samples for evaluation", type=int, default=100) # number of samples to evaluate downstream performance
+parser.add_argument("--num_eval_samples", help="number of samples for evaluation", type=int, default=100) # number of samples to evaluate downstream performance
 parser.add_argument("--trials", help="number of evaluation trials", type=int, default=1) # trials to repeat entire experiment (with different random seeds)
 
 # =========================
@@ -59,22 +59,6 @@ parser.add_argument("--eval_specific_config", help="if specified, evaluate a spe
 parser.add_argument("--specific_data_config", help="if specific_config is set, use this specific data config", type=str, default=None)
 parser.add_argument("--specific_model_config", help="if specific_config is set, use this specific model config", type=str, default=None)
 
-class TimerCallback(TrainerCallback):
-    def __init__(self, max_duration_seconds):
-        self.max_duration = int(max_duration_seconds)
-        self.start_time = None
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        self.start_time = time.time()
-
-    def on_step_end(self, args, state, control, **kwargs):
-        elapsed = time.time() - self.start_time
-        if elapsed >= self.max_duration:
-            print(f"⏰ Max training time of {self.max_duration} seconds reached. Stopping.")
-            control.should_training_stop = True
-        return control
-
-
 args = vars(parser.parse_args())
 print("command-line args: ", args)
 
@@ -93,21 +77,15 @@ trials=int(args["trials"])
 cuda=int(args["evaluation_cuda"])
 cuda="cuda:"+str(cuda)
 BO_run = int(args["iterations"])
-total_data = int(args["num_data"])
+num_data = int(args["num_data"])
 tasks = str(args["eval_tasks"]).split(",")
 evaluation_weights = [1/len(tasks)] * len(tasks)
 lora_rank =int(args["lora_rank"])
 ucb_beta = float(args["ucb_beta"])
 run_BO_on = str(args["run_BO_on"])
-limit = int(args["limit"])
+num_eval_samples = int(args["num_eval_samples"])
 save_name = str(args["save_name"])
 data_cache_dir = str(args["data_cache_dir"])
-
-is_random_config = bool(args["eval_random_config"])
-num_random_configs = int(args["num_random_configs"])
-is_specific_config = bool(args["eval_specific_config"])
-specific_data_config = str(args["specific_data_config"]).split(",")
-specific_model_config = str(args["specific_model_config"]).split(",")
 
 acq_function = str(args["acq_function"])
 optimize_method = str(args["optimize_method"])
@@ -177,10 +155,11 @@ elif model == "qwen-32b":
 else:
     assert False, "model not recognized"
 
+# how to form the data mixture
 sample_method = "random"
-results = [] # GP best seen so far
-full_inputs_results = [] # all inputs tried
-full_train_performance_results = [] # best seen full performance (theoretical, if we performed fully)
+results = []
+full_inputs_results = []
+full_train_performance_results = []
 for x in range(trials):
     
     rng = random.Random()
@@ -205,25 +184,41 @@ for x in range(trials):
         model_id="Qwen/Qwen3-32B"
     else:
         assert False, "model not recognized"
+    
+    class TimerCallback(TrainerCallback):
+        def __init__(self, max_duration_seconds):
+            self.max_duration = int(max_duration_seconds)
+            self.start_time = None
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.start_time = time.time()
+
+        def on_step_end(self, args, state, control, **kwargs):
+            elapsed = time.time() - self.start_time
+            if elapsed >= self.max_duration:
+                print(f"⏰ Max training time of {self.max_duration} seconds reached. Stopping.")
+                control.should_training_stop = True
+            return control
+
     GP_input, full_inputs, observed_output, gp, all_fidelity_levels, full_train_performance = joint_opt_BO_LLM_generalized(default_lora_config=default_lora_config, 
                                                                     time_callback=TimerCallback(time_limit),
                                                                     lora_rank_max=lora_rank,
                                                                     data_domains = data_domains,
-                                                                BO_run = BO_run,
-                                                                total_data = total_data,
-                                                                evaluation_task = evaluation_task,
-                                                                eval_method=eval_method,
-                                                                BO_params = BO_params,
-                                                                sampling_method = sample_method, 
-                                                                train_epochs=train_epochs, 
-                                                                training_batch=training_batch, 
-                                                                evaluation_batch=evaluation_batch,
-                                                                eval_steps=evaluation_steps,
-                                                                limit=limit,
-                                                                seed=seed,
-                                                                model_id=model_id,
-                                                                what_to_optimize=run_BO_on,
-                                                                data_cache_dir=data_cache_dir)
+                                                                    BO_run = BO_run,
+                                                                    total_number_datapoints = num_data,
+                                                                    evaluation_task = evaluation_task,
+                                                                    eval_method=eval_method,
+                                                                    BO_params = BO_params,
+                                                                    sampling_method = sample_method, 
+                                                                    train_epochs=train_epochs, 
+                                                                    training_batch=training_batch, 
+                                                                    evaluation_batch=evaluation_batch,
+                                                                    eval_steps=evaluation_steps,
+                                                                    num_eval_samples=num_eval_samples,
+                                                                    seed=seed,
+                                                                    model_id=model_id,
+                                                                    what_to_optimize=run_BO_on,
+                                                                    data_cache_dir=data_cache_dir)
 
     current_max = float('-inf')  # Start with negative infinity
     max_until_now = []           # List to store max values at each step

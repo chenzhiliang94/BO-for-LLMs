@@ -6,16 +6,16 @@ export CUDA_VISIBLE_DEVICES=0
 # ----------------------- #
 # Shared configuration
 # ----------------------- #
-ITER=2
-NUM_DATA=500
+ITER=50
+NUM_DATA=10000
 EPOCHS=1
 TRIALS=1
 EXP_SETTING=in_dist
-TIME_LIMIT=60
+TIME_LIMIT=1000
 LORA_RANK=128
-NUM_EVAL_SAMPLES=5
-TRAIN_BATCH=4
-EVAL_BATCH=4
+NUM_EVAL_SAMPLES=100
+TRAIN_BATCH=8
+EVAL_BATCH=8
 OUTPUT_DIR=results
 PRINTOUT_DIR=printouts
 USE_JOBS=0
@@ -28,11 +28,11 @@ UCB_BETA=20
 OPT_METHODS=("random" "multi_fidelity" "multi_fidelity_KG" "mixed")
 ACQ_FUNCS=("ucb" "EI")
 EVAL_METHODS=("eval_loss" "performance")
-RUN_BO_ON_OPTIONS=("both")
+RUN_BO_ON_OPTIONS=("data")
 MODELS=("llama-8b" "qwen-7b")
 
 # evaluation tasks
-TASKS=("arc_challenge" "triviaqa,truthfulqa_gen")
+TASKS=("triviaqa")
 
 # Track failures
 FAILED_JOBS=()
@@ -131,7 +131,7 @@ done
 # ----------------------- #
 
 echo "==============================================="
-echo "Unit Test Summary"
+echo "Summary of Data Optimization Runs"
 echo "==============================================="
 
 if [ ${#FAILED_JOBS[@]} -eq 0 ]; then
