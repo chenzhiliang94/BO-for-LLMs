@@ -4,11 +4,10 @@ import time
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from influence import *
 torch.set_warn_always(False)
 from copy import deepcopy
 from typing import List
-from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import lm_eval
 from lm_eval.models.huggingface import HFLM
 
@@ -26,6 +25,7 @@ from peft import (
 from LLM.tokenize_util import *
 import torch
 import torch.nn as nn
+
 # Define a simple MLP
 class Predictor(nn.Module):
     def __init__(self, input_dim):
@@ -80,14 +80,7 @@ num_epochs = 100
 learning_rate= 3e-4
 cutoff_len = 256
 val_set_size = 2000
-# lora hyperparams
-lora_r = 8
-lora_alpha = 16
-lora_dropout= 0.05
-lora_target_modules = [
-    "q_proj",
-    "v_proj",
-]
+
 # llm hyperparams
 train_on_inputs = True  # if False, masks out inputs in loss
 add_eos_token = False
@@ -236,9 +229,7 @@ def extract_data_mixture_and_train(model, tokenizer, train_datasets, val_dataset
         all_sampled_val_data.append(sampled_val_data)
     
     combined_train_dataset = concatenate_datasets(all_sampled_train_data)
-    # combined_val_dataset = concatenate_datasets(all_sampled_val_data)
-    # combined_val_dataset = combined_val_dataset.shuffle(seed=42).select(range(100)) # this is validation data for training data
-    
+
     print("length of training data: ", len(combined_train_dataset))
     if evaluation_dataset is None:
         print("evaluation dataset not given. This means we are not using evaluation loss. Will just use training data and evaluation loss")
@@ -615,7 +606,7 @@ def evaluate_tasks(tasks : List[str], model, tokenizer, batch=1, few_shot=1, lim
     return results
 
 def load_data(data_domain, data_cache_dir):
-        # Load the dataset
+    # Load the dataset
     print(data_domain)
     if data_domain == "headqa_en":
         data_domain = "headqa"
@@ -684,5 +675,5 @@ def load_data(data_domain, data_cache_dir):
         train_dataset = dataset["test"]
         val_dataset = dataset["test"]
     else:
-        assert False, "data_domain not valid, pls check"
+        assert False, "data_domain not valid, please check and verify."
     return train_dataset, val_dataset

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 export TQDM_DISABLE=1
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=4
 
 # ----------------------- #
 # Shared configuration
@@ -24,15 +24,15 @@ UCB_BETA=20
 # ----------------------- #
 # Sweep variables
 # ----------------------- #
-
-OPT_METHODS=("multi_fidelity_KG")
+OPT_METHODS=("mixed")
 ACQ_FUNCS=("ucb")
 EVAL_METHODS=("eval_loss")
 RUN_BO_ON_OPTIONS=("both")
 MODELS=("llama-8b")
+TRAINING_TASKS_OPTIONS=("triviaqa,truthfulqa_gen,gsm8k")
 
 # evaluation tasks
-TASKS=("arc_challenge" "triviaqa,truthfulqa_gen")
+TASKS=("gsm8k")
 
 # Track failures
 FAILED_JOBS=()
@@ -54,21 +54,28 @@ run_job() {
     local eval_method=$4
     local run_bo_on=$5
     local model=$6
+    local training_tasks=$7
     local seed=13549
 
-    INFO_PRINTOUT="_${opt_method}_acq_${acq_func}_eval_${eval_method}_bo_${run_bo_on}"
-    SAVE_NAME="${model}_${acq_func}_${task}_${INFO_PRINTOUT}.json"
+    # create a random run id with random
+    run_id=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 8)
+
+    INFO_PRINTOUT="UNIT_TEST_${opt_method}_acq_${acq_func}_eval_${eval_method}_bo_${run_bo_on}_run_id_${run_id}"
+    SAVE_NAME="${model}_${acq_func}_${INFO_PRINTOUT}.json"
     LOG_FILE="${PRINTOUT_DIR}/${model}_${acq_func}_${task}_${INFO_PRINTOUT}.out"
 
     echo "==============================================="
     echo "MODEL=$model"
     echo "RUN_BO_ON=$run_bo_on"
     echo "TASK=$task"
+    echo "TRAINING_TASKS=$training_tasks"
     echo "OPT_METHOD=$opt_method"
     echo "ACQ_FUNC=$acq_func"
     echo "EVAL_METHOD=$eval_method"
     echo "OUTPUT AT ${LOG_FILE}"
-    echo "RESULTS WILL BE SAVED AT ${OUTPUT_DIR}/${SAVE_NAME}"
+    # the task, make it comma separated into separated by _
+    # and add it to the print here
+    echo "RESULTS WILL BE SAVED AT ${OUTPUT_DIR}/${task//,/_}/${SAVE_NAME}"
     echo "==============================================="
 
     python3 -u BO_runs_LLM_joint_optimization.py \
@@ -77,6 +84,7 @@ run_job() {
         --epochs=$EPOCHS \
         --trials=$TRIALS \
         --eval_tasks=$task \
+        --training_tasks=$training_tasks \
         --experiments_setting=$EXP_SETTING \
         --time_limit=$TIME_LIMIT \
         --lora_rank=$LORA_RANK \
@@ -114,11 +122,13 @@ run_job() {
 
 for model in "${MODELS[@]}"; do
     for run_bo_on in "${RUN_BO_ON_OPTIONS[@]}"; do
-        for task in "${TASKS[@]}"; do
-            for opt_method in "${OPT_METHODS[@]}"; do
-                for acq_func in "${ACQ_FUNCS[@]}"; do
-                    for eval_method in "${EVAL_METHODS[@]}"; do
-                        run_job "$task" "$opt_method" "$acq_func" "$eval_method" "$run_bo_on" "$model"
+        for training_tasks in "${TRAINING_TASKS_OPTIONS[@]}"; do
+            for task in "${TASKS[@]}"; do
+                for opt_method in "${OPT_METHODS[@]}"; do
+                    for acq_func in "${ACQ_FUNCS[@]}"; do
+                        for eval_method in "${EVAL_METHODS[@]}"; do
+                            run_job "$task" "$opt_method" "$acq_func" "$eval_method" "$run_bo_on" "$model" "$training_tasks"
+                        done
                     done
                 done
             done

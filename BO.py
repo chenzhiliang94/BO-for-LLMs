@@ -11,18 +11,17 @@ from botorch.models.transforms import Normalize
 import time
 import torch
 import numpy as np
-import random
 import os
 from tqdm import tqdm
 from typing import List
-import json
 
+from transformers import TrainerCallback
 from datasets import concatenate_datasets
 from LLM.llm import sample, tokenizing_method, train_on_inputs, add_eos_token, evaluate_tasks, get_tokenizer_and_model, load_data, extract_data_mixture_and_train
 from LLM.tokenize_util import tokenizing_method
-from train_predictor_variable import MetricPredictorMLP
-
-from transformers import TrainerCallback
+from BO_utils.acquisition_functions import CostScaledLogEI, CostScaledUCB, CostScaledKG, cost_fn
+from BO_utils.utils import print_non_lora_params, print_lora_params
+from BO_utils.utils import randomly_generate_data, print_inputs, arrange_lora_config, process_candidate, inverse_process_candidate, generate_bounds
 
 os.environ["HF_ALLOW_CODE_EXECUTION"] = "1"
 
@@ -30,496 +29,70 @@ from peft import (
     LoraConfig,
     get_peft_model,
 )
+       
+def to_serializable(val: float | int | torch.Tensor | np.floating | np.integer) -> float | int:
+    """Convert a value to a JSON-serializable Python float or int.
 
-lora_alpha = 16
-lora_dropout= 0.05
-lora_r=16
-scaling_weight=1.08
-kernel_w=1.05
-lora_target_modules = [
-    "q_proj",
-    "v_proj",
-]
-lora_config = LoraConfig(
-    r=lora_r,
-    lora_alpha=lora_alpha,
-    target_modules=lora_target_modules,
-    lora_dropout=lora_dropout,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
+    Handles torch Tensors (scalar), numpy floating/integer types, and
+    native Python float/int. Returns the value unchanged if none of
+    the known types match.
 
-def print_non_lora_params(model, title=""):
-    print(f"\n===== {title} =====")
-    count = 0
-    for name, param in model.named_parameters():
-        # Exclude LoRA parameters
-        if "lora_" not in name:
-            print(name, param.data.view(-1)[:5])
-            count += 1
-            if count >= 5:
-                break
-            
-def print_lora_params(model, title=""):
-    print(f"\n===== {title} =====")
-    count = 0
-    for name, param in model.named_parameters():
-        if "lora_" in name and param.requires_grad:
-            print(name, param.data.view(-1)[:5])
-            count += 1
-            if count >= 5:
-                break
-        
-# Convert all elements to float or int for JSON serialization
-def to_serializable(val):
+    Args:
+        val: A scalar value that may be a Tensor, numpy type, or native Python type.
+
+    Returns:
+        A plain Python float or int suitable for JSON serialization.
+    """
     if isinstance(val, torch.Tensor):
         val = val.item()
     return float(val) if isinstance(val, float) or isinstance(val, np.floating) else int(val) if isinstance(val, int) or isinstance(val, np.integer) else val
 
-# initialize a list of size n, with random 0/1 values
-def sample_random_mask(n=5):
-    # Sample random 0/1 mask
-    mask = [random.choice([0, 1]) for _ in range(n)]
-    
-    # If all zeros, force last element to 1
-    if sum(mask) == 0:
-        mask[-1] = 1
-    
-    return mask
-
-def randomly_generate_data(what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max, BO_params, seed=None):
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-    else:
-        random.seed()
-        np.random.seed()
-    if what_to_optimize == "data":
-        k = len(data_domains)
-        input_X = np.random.dirichlet([1.0] * k).tolist()
-        input_X_between_0_1 = input_X[:] # already between 0 and 1
-        
-    elif what_to_optimize == "model":
-        # num_layers_to_apply
-        num_layers = random.randint(1, lora_max_num_layers)
-        input_X = [num_layers]
-        input_X_between_0_1 = [num_layers / lora_max_num_layers]
-
-        # random mask of 0/1 for 5 layers
-        mask = sample_random_mask(5)
-        input_X += mask
-        input_X_between_0_1 += mask
-
-        # rank
-        rank = random.randint(1, lora_rank_max)
-        input_X.append(rank)
-        input_X_between_0_1.append(rank / lora_rank_max)
-
-        # dropout
-        dropout = random.uniform(0.0, 0.1)   # adjust domain if needed
-        input_X.append(dropout)
-        input_X_between_0_1.append(dropout / 0.1)
-
-        # alpha
-        alpha = random.randint(1, 48)
-        input_X.append(alpha)
-        input_X_between_0_1.append(alpha / 48)
-
-        # reverse
-        reverse = random.choice([0, 1])
-        input_X.append(reverse)
-        input_X_between_0_1.append(reverse)
-    else: # optimize both
-        
-        # data mixture
-        k = len(data_domains)
-        input_X = np.random.dirichlet([1.0] * k).tolist()
-        input_X_between_0_1 = input_X[:] # already between 0 and 1
-        
-        # num_layers_to_apply
-        num_layers = random.randint(1, lora_max_num_layers)
-        input_X.append(num_layers)
-        input_X_between_0_1.append(num_layers / lora_max_num_layers)
-
-        # random mask of 0/1 for 5 layers
-        mask = sample_random_mask(5)
-        input_X += mask
-        input_X_between_0_1 += mask
-
-        # rank
-        rank = random.randint(1, lora_rank_max)
-        input_X.append(rank)
-        input_X_between_0_1.append(rank / lora_rank_max)
-
-        # dropout
-        dropout = random.uniform(0.0, 0.1)
-        input_X.append(dropout)
-        input_X_between_0_1.append(dropout / 0.1)
-
-        # alpha
-        alpha = random.randint(1, 48)
-        input_X.append(alpha)
-        input_X_between_0_1.append(alpha / 48)
-
-        # reverse
-        reverse = random.choice([0, 1])
-        input_X.append(reverse)
-        input_X_between_0_1.append(reverse)
-        
-    print("We are at initial step. BO_params[\"optimize_method\"]:", BO_params["optimize_method"])
-    fidelity = None
-    if BO_params["optimize_method"] == "multi_fidelity" or BO_params["optimize_method"] == "multi_fidelity_KG":
-        fidelity = random.choice([0, 1])
-        print("fidelity is required. Randomly generating fidelity: ", fidelity)
-    else:
-        print("fidelity is not required")
-    return input_X, input_X_between_0_1, fidelity
-
-# cost per fidelity
-def cost_fn(X):
-    fidelity = X[..., -1]          # assuming last column is fidelity
-    return 1 + fidelity         # Example (you choose your own)
-
-class CostScaledLogEI(AcquisitionFunction):
-    def __init__(self, model, best_f, cost_fn, current_itr):
-        super().__init__(model)
-        self.log_ei = LogExpectedImprovement(model=model, best_f=best_f)
-        self.cost_fn = cost_fn  # cost_fn: X -> cost
-        self.current_itr = current_itr
-        
-    def forward(self, X):
-        logei_val = self.log_ei(X)
-        cost = self.cost_fn(X)
-
-        return - logei_val / cost.squeeze(-1) # divide acquisition value with the cost to get improvement per cost
-
-class CostScaledUCB(AcquisitionFunction):
-    def __init__(self, model, beta, cost_fn):
-        super().__init__(model)
-        self.ucb = UpperConfidenceBound(model=model, beta=beta)
-        self.cost_fn = cost_fn  # X -> cost
-
-    def forward(self, X):
-        """
-        X: batch_shape x q x d
-        """
-        ucb_val = self.ucb(X)              # shape: batch_shape
-        cost = self.cost_fn(X).squeeze(-1) # shape: batch_shape
-
-        return ucb_val / cost
-
-class CostScaledKG(AcquisitionFunction):
-    def __init__(
-        self,
-        model,
-        cost_fn,
-        num_fantasies,
-        current_max_pmean,
-        sampler,
-    ):
-        super().__init__(model)
-
-        self.num_fantasies = num_fantasies
-
-        self.kg = qKnowledgeGradient(
-            model=model,
-            num_fantasies=num_fantasies,
-            current_value=current_max_pmean,
-            sampler=sampler,
-        )
-
-        self.cost_fn = cost_fn
-
-    def forward(self, X):
-        """
-        X: batch_shape x (1 + num_fantasies) x d
-        """
-
-        # KG value: scalar per batch
-        kg_val = self.kg(X)  # shape: batch_shape
-
-        # Cost of the REAL point only
-        real_X = X[..., :1, :]                     # batch x 1 x d
-        cost = self.cost_fn(real_X)                # batch x 1 or batch
-        cost = cost.squeeze(-1).squeeze(-1)        # batch
-
-        return kg_val / cost
-    
-def print_inputs(
-    input_X,
+def get_lora_and_mixing_ratio(
+    input_X: List[float],
+    what_to_optimize: str,
     data_domains: List[str],
-    run_bo_on="both"
-) -> None:
-    idx = len(data_domains)
-    mixing_ratio = input_X[:idx]
-    # check lengths
-    assert len(data_domains) == len(mixing_ratio), "length of data domains and mixing ratio should be the same"
+    lora_max_num_layers: int,
+    default_lora_config: LoraConfig,
+    fidelity: int | None
+) -> tuple[LoraConfig | None, List[float], dict]:
+    """Derive the LoRA config, data mixing ratio, and discrete-dim map from a candidate input X.
 
-    print("=== Candidate ===")
-    
-    print("\nData Domains and Mixing Ratios:")
-    for domain, ratio in zip(data_domains, mixing_ratio):
-        if isinstance(ratio, torch.Tensor):
-            ratio = ratio.item()
-        print(f"  {domain}: {round(ratio,3)}")
-    
-    if run_bo_on != "data":
-        lora_r=input_X[-4]
-        lora_dropout=input_X[-3]
-        num_layers_to_apply=input_X[idx]
-        five_dim_vector=input_X[idx+1:idx+1+5]
-        lora_alpha = input_X[-2]
-        lora_reverse = input_X[-1]
-        
-        print("number of layers to apply lora: ", num_layers_to_apply)
-        print("which modules to apply lora (q_proj, v_proj, up_proj, down_proj, gate_proj): ", five_dim_vector) 
-        print("lora rank: ", lora_r)   
-        print("lora dropout: ", lora_dropout)
-        print("lora alpha: ", lora_alpha)
-        print("lora reverse (apply to rear layers if False, else front layers): ", lora_reverse)
-    
-    print("=========================\n")
-    
-def arrange_lora_config(lora_r, lora_dropout, num_layers_to_apply, five_dim_vector, lora_alpha, lora_reverse : bool, max_num_layers) -> LoraConfig:
-    '''
-    lora_r: float
-    lora_dropout = float 
-    num_layers_to_apply = int
-    five_dim_vector = List[float]. Five dimension
-    lora_alpha = alpha
-    lora_reverse = whether to reverse apply the lora to front layers or rear layers
-    max_num_layers = int. Maximum number of layers in the model
-    '''
-    lora_r = int(lora_r)
-    num_layers_to_apply = int(num_layers_to_apply)
-    five_dim_vector = [int(x) for x in five_dim_vector] # convert to int
-    if sum(five_dim_vector) == 0:
-        return None
-    print("creating lora config with parameters, to be trained.")
+    Depending on ``what_to_optimize``, either uses defaults or extracts values
+    from ``input_X`` to build the LoRA configuration and the per-domain
+    mixing ratio.  Also returns the ``discrete_dims`` dict required by
+    ``MixedSingleTaskGP`` / ``optimize_acqf_mixed_alternating``.
 
-    # only .mlp layers have up, down, gate proj
-    # only .self_attn layers have q, v, k proj
-    # ["model.layers.0.self_attn.k_proj"]
-    lora_modules_all = ["q_proj", "v_proj", "up_proj", "down_proj", "gate_proj"]
-    lora_module_to_tune = [mod for mod, flag in zip(lora_modules_all, five_dim_vector) if flag == 1]
-    lora_specific_modules = []
-
-    for module in lora_module_to_tune:
-        if module == "q_proj" or module == "v_proj" or module == "k_proj":
-            for i in range(num_layers_to_apply):
-                if lora_reverse: # apply to front layers
-                    lora_specific_modules.append("model.layers."+str(i)+".self_attn."+module)
-                else: # apply to rear layers
-                    lora_specific_modules.append("model.layers."+str(max_num_layers-1-i)+".self_attn."+module)
-        else:
-            for i in range(num_layers_to_apply):
-                if lora_reverse:
-                    lora_specific_modules.append("model.layers."+str(i)+".mlp."+module)
-                else:
-                    lora_specific_modules.append("model.layers."+str(max_num_layers-1-i)+".mlp."+module)
-    
-    config = LoraConfig(
-    r=lora_r,
-    lora_alpha=lora_alpha,
-    target_modules=lora_specific_modules,
-    lora_dropout=lora_dropout,
-    bias="none",
-    task_type="CAUSAL_LM",)
-
-    return config
-
-def process_candidate(candidate, what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max) -> List[float]:
-    # -------------------------
-    # Candidate processing
-    # input candidate is normalized
-    # but we want to project them to the real values
-    # note that this does not include fidelity
-    # -------------------------
-
-    processed_candidate = []
-    idx = 0
-    
-    if what_to_optimize == "data":
-        assert len(candidate) == len(data_domains), "length of candidate should be equals to data domains length, since we are only optimizing data"
-        
-        # only data
-        for v in candidate:
-            processed_candidate.append(0 if v.item()<0.01 else v)
-            
-        assert sum(processed_candidate) < 1, "Sum of data mixing ratios should be less than 1"
-        return processed_candidate
-    
-    if what_to_optimize == "model":
-        idx = 0
-        processed_candidate.append(round(lora_max_num_layers*candidate[idx].item())) # num_layers_to_apply
-        idx += 1
-        processed_candidate += [round(v.item()) for v in candidate[idx:idx+5]] # layer mask
-        idx += 5
-        processed_candidate.append(round(lora_rank_max*candidate[idx].item())) # rank
-        idx += 1
-        processed_candidate.append(0.1 * candidate[idx].item()) # dropout
-        idx += 1
-        processed_candidate.append(48.0 * candidate[idx].item()) # alpha
-        idx += 1
-        processed_candidate.append(round(candidate[idx].item())) # whether to reverse apply LoRA
-        
-        return processed_candidate
-    
-    elif what_to_optimize == "both":
-        assert len(candidate) == len(data_domains) + 10, "length of candidate should be equals to data domains length + 10, since we are optimizing both data and model"
-        
-        # data
-        for v in candidate[:len(data_domains)]:
-            processed_candidate.append(0 if v.item()<0.01 else v)
-        
-        # model
-        idx = len(data_domains)
-        processed_candidate.append(round(lora_max_num_layers*candidate[idx].item())) # num_layers_to_apply
-        idx += 1
-        processed_candidate += [round(v.item()) for v in candidate[idx:idx+5]] # layer mask
-        idx += 5
-        processed_candidate.append(round(lora_rank_max*candidate[idx].item())) # rank
-        idx += 1
-        processed_candidate.append(0.1 * candidate[idx].item()) # dropout
-        idx += 1
-        processed_candidate.append(48.0 * candidate[idx].item()) # alpha
-        idx += 1
-        processed_candidate.append(round(candidate[idx].item())) # reverse
-        return processed_candidate
-    
-    assert False, "what_to_optimize is not properly set."
-
-def inverse_process_candidate(processed_candidate, what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max) -> List[float]:
-    """
-    Converts processed_candidate (actual values) back to candidate (normalized 0-1 values).
-    
     Args:
-        processed_candidate: List of actual parameter values.
-        what_to_optimize: String, one of "data", "model", or "both".
-        data_domains: List of data domains (needed for length calculations).
-        lora_max_num_layers: Maximum number of LoRA layers (scaling factor).
-        lora_rank_max: Maximum LoRA rank (scaling factor).
-        
+        input_X: Candidate parameter vector (actual values).
+        what_to_optimize: One of ``"data"``, ``"model"``, or ``"both"``.
+        data_domains: Data domain names.
+        lora_max_num_layers: Total number of layers in the base model.
+        default_lora_config: Fallback LoRA config used when only data is optimised.
+        fidelity: Current fidelity value; if not ``None``, fidelity is added to
+            ``discrete_dims``.
+
     Returns:
-        Tensor of normalized candidate values (between 0 and 1).
+        lora_config: The constructed (or default) ``LoraConfig``.
+        mixing_ratio: Per-domain data mixing ratios.
+        discrete_dims: Mapping from dimension index to allowed discrete values.
     """
-    candidate = []
-    
-    if what_to_optimize == "data":
-        assert len(processed_candidate) == len(data_domains), "Length mismatch for 'data' optimization"
-        
-        # Inverse of data mixing ratios (Direct mapping)
-        # Note: If the forward pass zeroed out a value < 0.01, we recover 0.0.
-        candidate = [float(v) for v in processed_candidate]
-        
-    elif what_to_optimize == "model":
-        # Expected length is 10 based on the forward function (1 num_layer + 5 mask + 1 rank + 1 dropout + 1 alpha + 1 reverse)
-        assert len(processed_candidate) == 10, "Length mismatch for 'model' optimization"
-        
-        idx = 0
-        # 1. num_layers_to_apply: reversed round(lora_max_num_layers * x)
-        candidate.append(processed_candidate[idx] / lora_max_num_layers)
-        idx += 1
-        
-        # 2. layer mask (5 values): reversed round(x)
-        candidate.extend([float(x) for x in processed_candidate[idx:idx+5]])
-        idx += 5
-        
-        # 3. rank: reversed round(lora_rank_max * x)
-        candidate.append(processed_candidate[idx] / lora_rank_max)
-        idx += 1
-        
-        # 4. dropout: reversed 0.1 * x
-        candidate.append(processed_candidate[idx] / 0.1)
-        idx += 1
-        
-        # 5. alpha: reversed 48.0 * x
-        candidate.append(processed_candidate[idx] / 48.0)
-        idx += 1
-        
-        # 6. reverse: reversed round(x)
-        candidate.append(float(processed_candidate[idx]))
-        
-    elif what_to_optimize == "both":
-        assert len(processed_candidate) == len(data_domains) + 10, "Length mismatch for 'both' optimization"
-        
-        # --- Data Part ---
-        data_len = len(data_domains)
-        # Direct mapping for data ratios
-        candidate.extend([float(v) for v in processed_candidate[:data_len]])
-        
-        # --- Model Part ---
-        p_idx = data_len 
-        
-        # 1. num_layers_to_apply
-        candidate.append(processed_candidate[p_idx] / lora_max_num_layers)
-        p_idx += 1
-        
-        # 2. layer mask (5 values)
-        candidate.extend([float(x) for x in processed_candidate[p_idx:p_idx+5]])
-        p_idx += 5
-        
-        # 3. rank
-        candidate.append(processed_candidate[p_idx] / lora_rank_max)
-        p_idx += 1
-        
-        # 4. dropout
-        candidate.append(processed_candidate[p_idx] / 0.1)
-        p_idx += 1
-        
-        # 5. alpha
-        candidate.append(processed_candidate[p_idx] / 48.0)
-        p_idx += 1
-        
-        # 6. reverse
-        candidate.append(float(processed_candidate[p_idx]))
-
-    return candidate
-
-# function for generating bounds based on what_to_optimize
-def generate_bounds(what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max, fidelity) -> tuple[List[float], List[float]]:
-    # -------------------------
-    # Bounds
-    # -------------------------
-    lower_bound, upper_bound = [], []
-    if what_to_optimize == "data":
-        lower_bound += [0]*len(data_domains)
-        upper_bound += [1]*len(data_domains)
-    elif what_to_optimize == "model":
-        lower_bound += [1/lora_max_num_layers+0.01] + [0]*5 + [1/lora_rank_max+0.01] + [0.0] + [1/48+0.01] + [0.0]
-        upper_bound += [1] + [1]*5 + [1] + [1] + [1] + [1]
-    else:
-        lower_bound += [0]*len(data_domains)
-        upper_bound += [1]*len(data_domains)
-        lower_bound += [1/lora_max_num_layers+0.01] + [0]*5 + [1/lora_rank_max+0.01] + [0.0] + [1/48+0.01] + [0.0]
-        upper_bound += [1] + [1]*5 + [1] + [1] + [1] + [1]
-    # add to bounds for fidelity if needed
-    if fidelity is not None:
-        lower_bound.append(0.0)
-        upper_bound.append(1.0)
-    return lower_bound, upper_bound
-
-def get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_num_layers, default_lora_config, fidelity) -> tuple[LoraConfig, List[float], dict]:
-    '''
-    Takes in an input_X and create LoRA and mixing ratio, depending on what_to_optimize
-    '''
     # Build LoRA config if optimizing LoRA
     if what_to_optimize == "data":
-        lora_config = default_lora_config # default LoRA
+        lora_config = default_lora_config # default LoRA configuration
         mixing_ratio = input_X
         discrete_dims = {}
     elif what_to_optimize == "model":
         
         discrete_dims = {
                 1: [0,1], # modules
-                2: [0,1],
-                3: [0,1],
-                4: [0,1],
-                5: [0,1],
-                9: [0,1], # reverse?
+                2: [0,1], # module 2
+                3: [0,1], # module 3
+                4: [0,1], # module 4
+                5: [0,1], # module 5
+                9: [0,1], # whether to apply LoRA in reverse
             }
         
-        mixing_ratio = [1/len(data_domains)]*len(data_domains) # default using uniform
+        mixing_ratio = [1/len(data_domains)]*len(data_domains) # default using uniform mixture
         idx=0
         lora_config = arrange_lora_config(
             lora_r=input_X[-4],
@@ -532,13 +105,14 @@ def get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_
         )
         
     elif what_to_optimize == "both":
+        # specifies the discrete dimension
         discrete_dims = {
                 len(data_domains)+1: [0,1], # modules
-                len(data_domains)+2: [0,1],
-                len(data_domains)+3: [0,1],
-                len(data_domains)+4: [0,1],
-                len(data_domains)+5: [0,1],
-                len(data_domains)+9: [0,1] # reverse?
+                len(data_domains)+2: [0,1], # module 2
+                len(data_domains)+3: [0,1], # module 3
+                len(data_domains)+4: [0,1], # module 4
+                len(data_domains)+5: [0,1], # module 5
+                len(data_domains)+9: [0,1] # whether to apply LoRA in reverse
             }
         idx = len(data_domains)
         mixing_ratio = input_X[:idx]
@@ -560,29 +134,29 @@ def get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_
     return lora_config, mixing_ratio, discrete_dims
 
 def evaluate_single_configuration(
-                input_X,
-                fidelity,
-                what_to_optimize,
-                data_domains,
-                lora_max_num_layers,
-                lora_rank_max,
-                default_lora_config,
-                model_id,
-                train_datasets,
-                val_datasets,
+                input_X: List[float],
+                fidelity: int | None,
+                what_to_optimize: str,
+                data_domains: List[str],
+                lora_max_num_layers: int,
+                lora_rank_max: int,
+                default_lora_config: LoraConfig,
+                model_id: str,
+                train_datasets: list,
+                val_datasets: list,
                 all_sampled_evaluation_data,
-                total_number_datapoints,
-                sampling_method,
-                train_epochs,
-                training_batch,
-                max_steps,
-                eval_steps,
-                evaluation_task,
-                eval_method,
-                evaluation_batch,
-                num_eval_samples,
-                time_callback,
-                seed=42,
+                total_number_datapoints: int,
+                sampling_method: str,
+                train_epochs: int,
+                training_batch: int,
+                max_steps: int,
+                eval_steps: int,
+                evaluation_task: dict,
+                eval_method: str,
+                evaluation_batch: int,
+                num_eval_samples: int,
+                time_callback: TrainerCallback,
+                seed: int = 42,
             ) -> tuple[float, float, dict]:
                 """
                 Evaluates a single configuration (input_X) at a given fidelity level.
@@ -685,7 +259,38 @@ def evaluate_single_configuration(
                 
                 return observed_performance, realized_performance, train_results
 
-def evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, num_eval_samples) -> tuple[float, float]:
+def evaluate_final_performance(
+    model: torch.nn.Module,
+    tokenizer,
+    eval_method: str,
+    fidelity: int | None,
+    evaluation_task: dict,
+    train_results: dict,
+    evaluation_batch: int,
+    num_eval_samples: int
+) -> tuple[float, float]:
+    """Compute observed and realised performance after training.
+
+    For ``eval_method="performance"``, runs the evaluation harness tasks and
+    uses the best callback-recorded performance as the observed value.
+    For ``eval_method="eval_loss"``, uses the (negated) minimum eval loss,
+    with low-fidelity returning only the first-half trajectory minimum.
+
+    Args:
+        model: The trained model to evaluate.
+        tokenizer: Tokenizer associated with the model.
+        eval_method: ``"performance"`` or ``"eval_loss"``.
+        fidelity: Fidelity level (0 = low, 1 = high, ``None`` = single-fidelity).
+        evaluation_task: Dict mapping task name to ``(weight, metric)`` tuples.
+        train_results: Training output dict containing ``"eval_loss"`` and/or
+            ``"step_performances"``.
+        evaluation_batch: Batch size for evaluation.
+        num_eval_samples: Number of evaluation samples (0 means unlimited).
+
+    Returns:
+        observed_performance: What the GP observes (may be low-fidelity).
+        realized_performance: True end-of-training performance. This is used for plotting purpose to evaluate how well the BO is performing.
+    """
     model.eval()
     observed_performance = None # what is observed, possibly low-fidelity.
     realized_performance = None # performance at the end of training. Potentially the same as observed_performance.
@@ -717,21 +322,48 @@ def evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluati
     return observed_performance, realized_performance
 
 def fit_GP_and_suggest_next_candidate(
-    GP_input, 
-    observed_output, 
-    fidelity, 
-    what_to_optimize, 
-    BO_params, 
-    max_performance_so_far, 
-    bounds, 
+    GP_input: List[List[float]], 
+    observed_output: List[float], 
+    fidelity: int | None, 
+    what_to_optimize: str, 
+    BO_params: dict, 
+    max_performance_so_far: float, 
+    bounds: torch.Tensor, 
     cost_fn, 
-    data_domains, 
-    discrete_dims, 
-    itr, 
-    lora_max_num_layers, 
-    lora_rank_max
+    data_domains: List[str], 
+    discrete_dims: dict, 
+    itr: int, 
+    lora_max_num_layers: int, 
+    lora_rank_max: int
 ) -> tuple[torch.Tensor, int | None, SingleTaskGP | MixedSingleTaskGP | SingleTaskMultiFidelityGP]:
-            
+    """Fit a Gaussian Process to observations and propose the next candidate.
+
+    Selects the appropriate GP type (single-task, mixed, or multi-fidelity),
+    fits it via maximum likelihood, constructs the acquisition function
+    (UCB, EI, cost-scaled UCB, or Knowledge Gradient), optimises it subject
+    to equality / inequality constraints, and returns the best candidate.
+
+    Args:
+        GP_input: List of observed normalised input vectors.
+        observed_output: Corresponding observed objective values.
+        fidelity: Current fidelity setting (``None`` for single-fidelity).
+        what_to_optimize: One of ``"data"``, ``"model"``, or ``"both"``.
+        BO_params: BO config dict (keys: ``"optimize_method"``, ``"acq_function"``,
+            ``"ucb_beta"``, etc.).
+        max_performance_so_far: Best objective value seen so far (for EI).
+        bounds: ``(2, d)`` tensor of lower and upper bounds.
+        cost_fn: Cost function for multi-fidelity acquisition functions.
+        data_domains: Data domain names.
+        discrete_dims: Dict mapping dimension index → allowed discrete values.
+        itr: Current BO iteration (used for UCB beta schedule).
+        lora_max_num_layers: Max layers scaling factor.
+        lora_rank_max: Max rank scaling factor.
+
+    Returns:
+        candidate: ``(1, d)`` tensor of the proposed next normalised candidate.
+        next_fidelity: Suggested fidelity level, or ``None``.
+        gp: The fitted GP model.
+    """
     # fit GP
     if fidelity is not None:
         print("fitting a GP: SingleTaskMultiFidelityGP")
@@ -883,12 +515,12 @@ def fit_GP_and_suggest_next_candidate(
         return candidate, next_fidelity, gp
     else:
         assert False, "optimize_method not properly set."
+
 def joint_opt_BO_LLM_generalized(
     default_lora_config : LoraConfig,
     time_callback : object,
     lora_rank_max: int,
     data_domains: list,
-    BO_run: int,
     total_number_datapoints: int,
     evaluation_task: dict,
     eval_method: str,
@@ -977,7 +609,7 @@ def joint_opt_BO_LLM_generalized(
     all_fidelity_levels = []
     count_low_fidelity = 0
     count_high_fidelity = 0
-    pbar = tqdm(total=BO_run)
+    pbar = tqdm(total=BO_params["BO_iterations"])
     itr = 0
     
     # whether to apply JoBS
@@ -1003,7 +635,7 @@ def joint_opt_BO_LLM_generalized(
     #     except FileNotFoundError:
     #         raise FileNotFoundError(f"JoBS: Could not find predictor weights at {predictor_path}")
         
-    #     BO_run -= 20    # remove some iterations since we are using 20 prior observations to fit the GP initially
+    #     BO_params["BO_iterations"] -= 20    # remove some iterations since we are using 20 prior observations to fit the GP initially
 
     #     # Fit GP with prior observations collected for the predictor
     #     print("Fitting GP with prior observations collected for JoBS performance predictor...")
@@ -1220,7 +852,7 @@ def joint_opt_BO_LLM_generalized(
         else:
             input_X = input_X_between_0_1
     
-    while itr < BO_run:
+    while itr < BO_params["BO_iterations"]:
         print("\n\n\n")
         print("======== BO iteration: ", itr, " ==========")
         torch.manual_seed(seed)

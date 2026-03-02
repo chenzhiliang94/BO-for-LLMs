@@ -1,0 +1,11 @@
+{
+  "commonsense_qa": "acc,none",
+  "gsm8k": "exact_match,strict-match",
+  "rowan_hellaswag": "acc,none",
+  "sciq": "acc_norm,none",
+  "triviaqa": "exact_match,remove_whitespace",
+  "truthfulqa_gen": "bleu_acc,none",
+  "wikitext": "word_perplexity,none",
+  "mmlu": "acc,none",
+  "arc_challenge": "acc,none"
+}

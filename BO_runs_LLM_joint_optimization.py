@@ -1,4 +1,5 @@
 import random
+import json
 from BO import joint_opt_BO_LLM_generalized
 import torch
 
@@ -35,6 +36,7 @@ parser.add_argument("--JoBS", help="whether to apply scaling law", type=int, def
 # Evaluation configuration
 # =========================
 parser.add_argument("--eval_tasks", help="evaluation tasks") # comma separated list of evaluation tasks, e.g. "commonsense_qa,gsm8k"
+parser.add_argument("--training_tasks", help="comma-separated training domains, or 'ALL' to use all domains", type=str, default="ALL")
 parser.add_argument("--eval_method", help="evaluation method") # eval_loss or performance
 parser.add_argument("--evaluation_batch", help="evaluation batch size", type=int) # batch size for evaluation
 parser.add_argument("--evaluation_cuda", help="evaluation cuda device", default=0) # cuda to load evaluation LLM
@@ -76,7 +78,7 @@ epochs=int(args["epochs"])
 trials=int(args["trials"])
 cuda=int(args["evaluation_cuda"])
 cuda="cuda:"+str(cuda)
-BO_run = int(args["iterations"])
+BO_iterations = int(args["iterations"])
 num_data = int(args["num_data"])
 tasks = str(args["eval_tasks"]).split(",")
 evaluation_weights = [1/len(tasks)] * len(tasks)
@@ -90,41 +92,30 @@ data_cache_dir = str(args["data_cache_dir"])
 acq_function = str(args["acq_function"])
 optimize_method = str(args["optimize_method"])
 
-training_domain_metrics = {
-  "commonsense_qa": "acc,none",
-  "gsm8k": "exact_match,strict-match",
-  "rowan_hellaswag": "acc,none",
-  "sciq": "acc_norm,none",
-  "triviaqa": "exact_match,remove_whitespace",
-  "truthfulqa_gen": "bleu_acc,none",
-  "wikitext": "word_perplexity,none",
-  "mmlu": "acc,none",
-  "arc_challenge": "acc,none"
-}
+# read training_domain_metrics from /home/chenzhil/maplecg_nfs/BO-for-LLMs/configuration/all_data_domains_and_metrics.json
+training_domain_metrics_path = os.path.join(os.path.dirname(__file__), "configuration", "all_data_domains_and_metrics.json")
+training_domain_metrics = json.load(open(training_domain_metrics_path, "r"))
 
-eval_metrics = {
-  "commonsense_qa": "acc,none",
-  "gsm8k": "exact_match,strict-match",
-  "rowan_hellaswag": "acc,none",
-  "sciq": "acc_norm,none",
-  "triviaqa": "exact_match,remove_whitespace",
-  "truthfulqa_gen": "bleu_acc,none",
-  "wikitext": "word_perplexity,none",
-  "mmlu": "acc,none",
-  "arc_challenge": "acc,none"
-}
-
-# set up training data (depending if we want ood)
-data_domains_initial = list(training_domain_metrics.keys())
-if setting == "ood":
-    data_domains =  [x for x in data_domains_initial if x not in tasks] # remove training domain that is in task
+# set up training data
+training_tasks_arg = str(args["training_tasks"]).strip()
+if training_tasks_arg.upper() == "ALL":
+    # use all available domains, with optional OOD filtering
+    data_domains_initial = list(training_domain_metrics.keys())
+    if setting == "ood":
+        data_domains = [x for x in data_domains_initial if x not in tasks]
+    else:
+        data_domains = list(data_domains_initial)
 else:
-    data_domains = [x for x in data_domains_initial]
+    # use only the explicitly specified training domains
+    data_domains = [x.strip() for x in training_tasks_arg.split(",")]
+    # validate that all specified domains exist in the config
+    for d in data_domains:
+        assert d in training_domain_metrics, f"Training domain '{d}' not found in configuration. Available: {list(training_domain_metrics.keys())}"
 
 # set up evaluation tasks (and weights, if we have more than one evaluation task)
 evaluation_task = {}
 for task, weight in zip(tasks, evaluation_weights):
-    evaluation_task[task] = (float(weight), eval_metrics[task])
+    evaluation_task[task] = (float(weight), training_domain_metrics[task])
 
 print("evaluation tasks and weights: ", evaluation_task)
 
@@ -142,18 +133,8 @@ BO_params = {
     "ucb_beta": ucb_beta,
     "optimize_method": optimize_method, # either "mixed" or "standard" or "multi_fidelity" or "multi_fidelity_KG"
     "to_apply_joBS": to_apply_joBS,
+    "BO_iterations": BO_iterations
 }
-
-if model == "llama-8b":
-    model_id="meta-llama/Meta-Llama-3-8B-Instruct"
-elif model == "qwen-7b":
-    model_id="Qwen/Qwen2.5-7B-Instruct"
-elif model == "qwen-14b":
-    model_id="Qwen/Qwen3-14B"
-elif model == "qwen-32b":
-    model_id="Qwen/Qwen3-32B"
-else:
-    assert False, "model not recognized"
 
 # how to form the data mixture
 sample_method = "random"
@@ -164,13 +145,12 @@ for x in range(trials):
     
     rng = random.Random()
     seed = rng.randint(0, 1000)
-    default_lora_config = LoraConfig(
-            r=128,
-            lora_alpha=16,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"],
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",)
+    
+    # if we are only optimizing data mixtures, the default lora configuration is read from the json file and fixed.
+    config_path = os.path.join(os.path.dirname(__file__), "configuration", "default_lora_configuration.json")
+    with open(config_path, "r") as f:
+        lora_config_dict = json.load(f)
+    default_lora_config = LoraConfig(**lora_config_dict)
     
     print("running BO on both data and model")
 
@@ -204,7 +184,6 @@ for x in range(trials):
                                                                     time_callback=TimerCallback(time_limit),
                                                                     lora_rank_max=lora_rank,
                                                                     data_domains = data_domains,
-                                                                    BO_run = BO_run,
                                                                     total_number_datapoints = num_data,
                                                                     evaluation_task = evaluation_task,
                                                                     eval_method=eval_method,
@@ -218,7 +197,8 @@ for x in range(trials):
                                                                     seed=seed,
                                                                     model_id=model_id,
                                                                     what_to_optimize=run_BO_on,
-                                                                    data_cache_dir=data_cache_dir)
+                                                                    data_cache_dir=data_cache_dir,
+                                                                    num_initial_random_samples=10)
 
     current_max = float('-inf')  # Start with negative infinity
     max_until_now = []           # List to store max values at each step
@@ -238,9 +218,9 @@ for x in range(trials):
     ]
     full_inputs_results.append(full_inputs)
     full_train_performance_results.append(full_train_performance)
-final_info_stored[sample_method + "_best_seen"] = results
-final_info_stored[sample_method + "_full_inputs"] = full_inputs_results
-final_info_stored[sample_method + "_full_train_performance"] = full_train_performance
+final_info_stored["best_seen_performance"] = results
+final_info_stored["inputs_iterated"] = full_inputs_results
+final_info_stored["train_performance"] = full_train_performance
     
     
 import json
