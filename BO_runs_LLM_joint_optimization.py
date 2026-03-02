@@ -1,6 +1,6 @@
 import random
 import json
-from BO import joint_opt_BO_LLM_generalized
+from BO_utils.BO import joint_opt_BO_LLM_generalized
 import torch
 
 from peft import LoraConfig

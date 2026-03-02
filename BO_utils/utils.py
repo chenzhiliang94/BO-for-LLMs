@@ -171,7 +171,6 @@ def randomly_generate_data(
         input_X.append(reverse)
         input_X_between_0_1.append(reverse)
         
-    print("We are at initial step. BO_params[\"optimize_method\"]:", BO_params["optimize_method"])
     fidelity = None
     if BO_params["optimize_method"] == "multi_fidelity" or BO_params["optimize_method"] == "multi_fidelity_KG":
         fidelity = random.choice([0, 1])
