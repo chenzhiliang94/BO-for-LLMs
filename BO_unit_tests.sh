@@ -25,11 +25,11 @@ UCB_BETA=20
 # Sweep variables
 # ----------------------- #
 
-OPT_METHODS=("random" "multi_fidelity" "multi_fidelity_KG" "mixed")
-ACQ_FUNCS=("ucb" "EI")
-EVAL_METHODS=("eval_loss" "performance")
+OPT_METHODS=("multi_fidelity_KG")
+ACQ_FUNCS=("ucb")
+EVAL_METHODS=("eval_loss")
 RUN_BO_ON_OPTIONS=("both")
-MODELS=("llama-8b" "qwen-7b")
+MODELS=("llama-8b")
 
 # evaluation tasks
 TASKS=("arc_challenge" "triviaqa,truthfulqa_gen")

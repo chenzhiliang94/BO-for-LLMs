@@ -249,7 +249,7 @@ def print_inputs(
     input_X,
     data_domains: List[str],
     run_bo_on="both"
-):
+) -> None:
     idx = len(data_domains)
     mixing_ratio = input_X[:idx]
     # check lengths
@@ -280,7 +280,7 @@ def print_inputs(
     
     print("=========================\n")
     
-def arrange_lora_config(lora_r, lora_dropout, num_layers_to_apply, five_dim_vector, lora_alpha, lora_reverse : bool, max_num_layers):
+def arrange_lora_config(lora_r, lora_dropout, num_layers_to_apply, five_dim_vector, lora_alpha, lora_reverse : bool, max_num_layers) -> LoraConfig:
     '''
     lora_r: float
     lora_dropout = float 
@@ -328,13 +328,14 @@ def arrange_lora_config(lora_r, lora_dropout, num_layers_to_apply, five_dim_vect
 
     return config
 
-# -------------------------
+def process_candidate(candidate, what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max) -> List[float]:
+    # -------------------------
     # Candidate processing
     # input candidate is normalized
     # but we want to project them to the real values
     # note that this does not include fidelity
     # -------------------------
-def process_candidate(candidate, what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max):
+
     processed_candidate = []
     idx = 0
     
@@ -388,7 +389,7 @@ def process_candidate(candidate, what_to_optimize, data_domains, lora_max_num_la
     
     assert False, "what_to_optimize is not properly set."
 
-def inverse_process_candidate(processed_candidate, what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max):
+def inverse_process_candidate(processed_candidate, what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max) -> List[float]:
     """
     Converts processed_candidate (actual values) back to candidate (normalized 0-1 values).
     
@@ -476,7 +477,7 @@ def inverse_process_candidate(processed_candidate, what_to_optimize, data_domain
     return candidate
 
 # function for generating bounds based on what_to_optimize
-def generate_bounds(what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max, fidelity):
+def generate_bounds(what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max, fidelity) -> tuple[List[float], List[float]]:
     # -------------------------
     # Bounds
     # -------------------------
@@ -492,16 +493,16 @@ def generate_bounds(what_to_optimize, data_domains, lora_max_num_layers, lora_ra
         upper_bound += [1]*len(data_domains)
         lower_bound += [1/lora_max_num_layers+0.01] + [0]*5 + [1/lora_rank_max+0.01] + [0.0] + [1/48+0.01] + [0.0]
         upper_bound += [1] + [1]*5 + [1] + [1] + [1] + [1]
-    dim_input_variables = len(lower_bound)
     # add to bounds for fidelity if needed
     if fidelity is not None:
         lower_bound.append(0.0)
         upper_bound.append(1.0)
     return lower_bound, upper_bound
 
- # write a function that does the lora config arrangement below:
-def get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_num_layers, default_lora_config, fidelity):
-    
+def get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_num_layers, default_lora_config, fidelity) -> tuple[LoraConfig, List[float], dict]:
+    '''
+    Takes in an input_X and create LoRA and mixing ratio, depending on what_to_optimize
+    '''
     # Build LoRA config if optimizing LoRA
     if what_to_optimize == "data":
         lora_config = default_lora_config # default LoRA
@@ -558,8 +559,133 @@ def get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_
     
     return lora_config, mixing_ratio, discrete_dims
 
-# evaluate performance at the end of full-training.
-def evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, num_eval_samples):
+def evaluate_single_configuration(
+                input_X,
+                fidelity,
+                what_to_optimize,
+                data_domains,
+                lora_max_num_layers,
+                lora_rank_max,
+                default_lora_config,
+                model_id,
+                train_datasets,
+                val_datasets,
+                all_sampled_evaluation_data,
+                total_number_datapoints,
+                sampling_method,
+                train_epochs,
+                training_batch,
+                max_steps,
+                eval_steps,
+                evaluation_task,
+                eval_method,
+                evaluation_batch,
+                num_eval_samples,
+                time_callback,
+                seed=42,
+            ) -> tuple[float, float, dict]:
+                """
+                Evaluates a single configuration (input_X) at a given fidelity level.
+                
+                Args:
+                    input_X: List of parameter values (data mixing ratios and/or LoRA params)
+                    fidelity: Fidelity level (0 for low, 1 for high, None for single-fidelity)
+                    ... (other parameters as needed for training and evaluation)
+                
+                Returns:
+                    observed_performance: Performance observed at the specified fidelity
+                    realized_performance: Full training performance (always high-fidelity)
+                    train_results: Dictionary containing training metrics and logs
+                """
+                print(f"\n=== Evaluating Configuration ===")
+                print(f"Fidelity level: {fidelity}")
+                
+                # Setup model and tokenizer
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+                tokenizer, model = get_tokenizer_and_model(model_id=model_id)
+                
+                # Print configuration
+                print_inputs(input_X, data_domains, what_to_optimize)
+                
+                # Get LoRA config and mixing ratio
+                lora_config, mixing_ratio, _ = get_lora_and_mixing_ratio(
+                    input_X, what_to_optimize, data_domains, lora_max_num_layers, 
+                    default_lora_config, fidelity
+                )
+                
+                # Apply LoRA to model
+                model = get_peft_model(model, lora_config)
+                model.print_trainable_parameters()
+                
+                # Setup performance callback if needed
+                callbacks = [time_callback]
+                if eval_method == "performance":
+                    class PerformanceEvalCallback(TrainerCallback):
+                        def __init__(self, tokenizer, eval_tasks):
+                            self.tokenizer = tokenizer
+                            self.target_eval_steps = {25, 50, 75, 100}
+                            self.eval_tasks = eval_tasks
+                            self.step_performances = {}
+                        
+                        def _evaluate_performance(self, model):
+                            model.eval()
+                            results = evaluate_tasks(
+                                list(self.eval_tasks.keys()), model, self.tokenizer, 
+                                batch=8, few_shot=3, limit=num_eval_samples
+                            )
+                            model.train()
+                            
+                            for task, value in self.eval_tasks.items():
+                                _, metric = value
+                                performance = results["results"][task][metric]
+                                break
+                            return performance
+                        
+                        def on_step_end(self, _args, state, _control, **kwargs):
+                            if state.global_step in self.target_eval_steps:
+                                performance = self._evaluate_performance(
+                                    kwargs.get('model')
+                                )
+                                key_name = f"performance_step_{state.global_step}"
+                                self.step_performances[key_name] = performance
+                    
+                    performance_eval_callback = PerformanceEvalCallback(tokenizer, evaluation_task)
+                    callbacks.append(performance_eval_callback)
+                
+                # Train model
+                train_results = extract_data_mixture_and_train(
+                    model=model,
+                    tokenizer=tokenizer,
+                    train_datasets=train_datasets,
+                    val_datasets=val_datasets,
+                    data_domains=data_domains,
+                    evaluation_dataset=all_sampled_evaluation_data,
+                    mixing_ratio=mixing_ratio,
+                    additional_info=[None for _ in data_domains],
+                    total_number_datapoints=total_number_datapoints,
+                    method=sampling_method,
+                    train_epochs=train_epochs,
+                    batch_size=training_batch,
+                    max_step=max_steps,
+                    lora_config=lora_config,
+                    eval_steps=eval_steps,
+                    callback=callbacks,
+                    seed=seed
+                )
+                
+                # Evaluate performance
+                observed_performance, realized_performance = evaluate_final_performance(
+                    model, tokenizer, eval_method, fidelity, evaluation_task, 
+                    train_results, evaluation_batch, num_eval_samples
+                )
+                
+                print(f"Observed performance: {observed_performance}")
+                print(f"Realized performance: {realized_performance}")
+                
+                return observed_performance, realized_performance, train_results
+
+def evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, num_eval_samples) -> tuple[float, float]:
     model.eval()
     observed_performance = None # what is observed, possibly low-fidelity.
     realized_performance = None # performance at the end of training. Potentially the same as observed_performance.
@@ -590,7 +716,21 @@ def evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluati
         
     return observed_performance, realized_performance
 
-def fit_GP_and_suggest_next_candidate(GP_input, observed_output, fidelity, what_to_optimize, BO_params, max_performance_so_far, bounds, cost_fn, data_domains, discrete_dims, itr, lora_max_num_layers, lora_rank_max):
+def fit_GP_and_suggest_next_candidate(
+    GP_input, 
+    observed_output, 
+    fidelity, 
+    what_to_optimize, 
+    BO_params, 
+    max_performance_so_far, 
+    bounds, 
+    cost_fn, 
+    data_domains, 
+    discrete_dims, 
+    itr, 
+    lora_max_num_layers, 
+    lora_rank_max
+) -> tuple[torch.Tensor, int | None, SingleTaskGP | MixedSingleTaskGP | SingleTaskMultiFidelityGP]:
             
     # fit GP
     if fidelity is not None:
@@ -618,7 +758,7 @@ def fit_GP_and_suggest_next_candidate(GP_input, observed_output, fidelity, what_
         acq = CostScaledUCB(model=gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5), cost_fn=cost_fn)
     if BO_params["optimize_method"] == "multi_fidelity_KG":
         print("building KG acq function")
-        num_fantasies = 64
+        num_fantasies = 8
         # base KG
         qKG = qKnowledgeGradient(gp, num_fantasies=num_fantasies)
     
@@ -627,8 +767,8 @@ def fit_GP_and_suggest_next_candidate(GP_input, observed_output, fidelity, what_
             acq_function=PosteriorMean(gp),
             bounds=bounds,
             q=1,
-            num_restarts=20,
-            raw_samples=2048,
+            num_restarts=10,
+            raw_samples=512,
         )
         
         acq = CostScaledKG(model=gp, cost_fn=cost_fn, num_fantasies=num_fantasies, current_max_pmean=max_pmean, sampler=qKG.sampler)
@@ -720,9 +860,11 @@ def fit_GP_and_suggest_next_candidate(GP_input, observed_output, fidelity, what_
 
         elif BO_params["optimize_method"] == "multi_fidelity_KG":
             t_prev = time.time()
-            q = 1 + 64  # for KG, we need to add one more batch
+            q = 1 + 8  # for KG, we need to add one more batch
+            print("Optimzing KG acquisition function, which is more computationally expensive since it involves fantasizing. This may take a while...")
             candidate, acq_value = optimize_acqf(
-                acq_function=acq, bounds=bounds, q=q, num_restarts=20, raw_samples=1024
+                acq_function=acq, bounds=bounds, q=q, num_restarts=10, raw_samples=512,
+                equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
             )
             candidate = candidate[0:1, :] # this is not a bug. we only take first entry because KG returns a 1 + 64 batches.
             t_now = time.time()
@@ -741,28 +883,28 @@ def fit_GP_and_suggest_next_candidate(GP_input, observed_output, fidelity, what_
         return candidate, next_fidelity, gp
     else:
         assert False, "optimize_method not properly set."
-                        
 def joint_opt_BO_LLM_generalized(
-        default_lora_config : LoraConfig,
-        time_callback : object,
-        lora_rank_max: int,
-        data_domains: list,
-        BO_run: int,
-        total_number_datapoints: int,
-        evaluation_task: dict,
-        eval_method: str,
-        BO_params : dict,
-        model_id : str,
-        sampling_method="random",
-        train_epochs: int = 1,
-        training_batch: int = 8,
-        evaluation_batch: int = 4,
-        max_steps=-1,
-        eval_steps=100,
-        num_eval_samples=100,
-        seed=42,
-        what_to_optimize : str = "both",
-        data_cache_dir : str = "./dataset_cache"):
+    default_lora_config : LoraConfig,
+    time_callback : object,
+    lora_rank_max: int,
+    data_domains: list,
+    BO_run: int,
+    total_number_datapoints: int,
+    evaluation_task: dict,
+    eval_method: str,
+    BO_params : dict,
+    model_id : str,
+    sampling_method="random",
+    train_epochs: int = 1,
+    training_batch: int = 8,
+    evaluation_batch: int = 4,
+    max_steps=-1,
+    eval_steps=100,
+    num_eval_samples=100,
+    seed=42,
+    what_to_optimize : str = "both",
+    data_cache_dir : str = "./dataset_cache",
+    num_initial_random_samples: int = 3):
     """
     Unified Bayesian Optimization loop for:
       - optimizing only data mixing ratios (optimize_data=True, optimize_lora=False)
@@ -811,10 +953,11 @@ def joint_opt_BO_LLM_generalized(
             all_sampled_evaluation_data.append(sampled_val_data)
         all_sampled_evaluation_data = concatenate_datasets(all_sampled_evaluation_data)
 
+    
+
     # -------------------------
     # Randomly initialize first input_X
     # -------------------------
-    # fidelity is a running current fidelity level if multi-fidelity BO is used
     input_X, input_X_between_0_1, fidelity = randomly_generate_data(what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max, BO_params, seed=42) # keep seed fixed for initial point
     lower_bound, upper_bound = generate_bounds(what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max, fidelity)
     bounds = torch.stack([torch.DoubleTensor(lower_bound), torch.DoubleTensor(upper_bound)])
@@ -838,167 +981,245 @@ def joint_opt_BO_LLM_generalized(
     itr = 0
     
     # whether to apply JoBS
-    if BO_params["to_apply_joBS"]:
-        # TBD
-        # 1. load the performance predictor (we might want to add an arg to load a predictor trained using different number of samples)
-        # 2. Edit the BO_run necessarily (this is to reduce the number of BO_run depending on number of data used for step 1).
-        # 3. Create some kind of callback here (to make early loss or performance evaluations; or a sequence of it) so that it can be passed into the training function
-        # 4. We DO NOT change the original time_callback variable to reduce the time. This is because we want to track the real performance gain from JoBS.
-        #    Our code handles this naturally anyways.
+    # if BO_params["to_apply_joBS"]:
+    #     # TBD
+    #     # 1. load the performance predictor (we might want to add an arg to load a predictor trained using different number of samples)
+    #     # 2. Edit the BO_run necessarily (this is to reduce the number of BO_run depending on number of data used for step 1).
+    #     # 3. Create some kind of callback here (to make early loss or performance evaluations; or a sequence of it) so that it can be passed into the training function
+    #     # 4. We DO NOT change the original time_callback variable to reduce the time. This is because we want to track the real performance gain from JoBS.
+    #     #    Our code handles this naturally anyways.
         
-        task = list(evaluation_task.keys())[0]
-        predictor_path = BO_params.get("predictor_path", f"trained_predictor_fixed_20train_10val/{eval_method}_H25_50_75_100_T625_curve/{task}/performance_mlp_20samples.pth")
-        input_dim = len(input_X) + 9    # +10 for training steps 25, 50, 75, 100 eval_loss/performance + training step 625
-        predictor_model = MetricPredictorMLP(input_dim=input_dim)
-        try:
-            print("input_dim for JoBS predictor: ", input_dim)
-            print("JoBS: Loading predictor from ", predictor_path)
-            # Map to CPU first to avoid device conflicts
-            predictor_model.load_state_dict(torch.load(predictor_path, map_location='cpu'))
-            predictor_model.eval()
-            print(f"JoBS: Predictor loaded successfully from {predictor_path}")
-        except FileNotFoundError:
-            raise FileNotFoundError(f"JoBS: Could not find predictor weights at {predictor_path}")
+    #     task = list(evaluation_task.keys())[0]
+    #     predictor_path = BO_params.get("predictor_path", f"trained_predictor_fixed_20train_10val/{eval_method}_H25_50_75_100_T625_curve/{task}/performance_mlp_20samples.pth")
+    #     input_dim = len(input_X) + 9    # +10 for training steps 25, 50, 75, 100 eval_loss/performance + training step 625
+    #     predictor_model = MetricPredictorMLP(input_dim=input_dim)
+    #     try:
+    #         print("input_dim for JoBS predictor: ", input_dim)
+    #         print("JoBS: Loading predictor from ", predictor_path)
+    #         # Map to CPU first to avoid device conflicts
+    #         predictor_model.load_state_dict(torch.load(predictor_path, map_location='cpu'))
+    #         predictor_model.eval()
+    #         print(f"JoBS: Predictor loaded successfully from {predictor_path}")
+    #     except FileNotFoundError:
+    #         raise FileNotFoundError(f"JoBS: Could not find predictor weights at {predictor_path}")
         
-        BO_run -= 20    # remove some iterations since we are using 20 prior observations to fit the GP initially
+    #     BO_run -= 20    # remove some iterations since we are using 20 prior observations to fit the GP initially
 
-        # Fit GP with prior observations collected for the predictor
-        print("Fitting GP with prior observations collected for JoBS performance predictor...")
-        with open(f"results_eval_random_in_dist/['{task}']_eval_results.json", "r") as f:
-            raw_data = json.load(f)
-        # Process raw_data to extract GP_input and observed_output
-        # Taking only the first 30 observations
-        for raw_sample in raw_data[:75]:
-            # Extract eval_loss/performance at step 625
-            if eval_method == "performance":
-                final_recorded_value = raw_sample['evaluations'][-1][eval_method]
-            elif eval_method == "eval_loss":
-                final_recorded_value = -raw_sample['evaluations'][-1][eval_method]  # need to negate for eval_loss
+    #     # Fit GP with prior observations collected for the predictor
+    #     print("Fitting GP with prior observations collected for JoBS performance predictor...")
+    #     with open(f"results_eval_random_in_dist/['{task}']_eval_results.json", "r") as f:
+    #         raw_data = json.load(f)
+    #     # Process raw_data to extract GP_input and observed_output
+    #     # Taking only the first 30 observations
+    #     for raw_sample in raw_data[:75]:
+    #         # Extract eval_loss/performance at step 625
+    #         if eval_method == "performance":
+    #             final_recorded_value = raw_sample['evaluations'][-1][eval_method]
+    #         elif eval_method == "eval_loss":
+    #             final_recorded_value = -raw_sample['evaluations'][-1][eval_method]  # need to negate for eval_loss
             
-            # Only add if we have both input and target
-            if 'input_X' in raw_sample and final_recorded_value is not None:
-                previous_input_X = raw_sample['input_X']
-                previous_input_X_between_0_1 = inverse_process_candidate(previous_input_X)
-                print("Checking history sample input_X: ", previous_input_X)
-                print("Checking history sample input_X_between_0_1: ", previous_input_X_between_0_1)
-                print(f"Checking history sample {eval_method} at 625 steps: ", final_recorded_value)
-                GP_input.append(previous_input_X_between_0_1)
-                observed_output.append(final_recorded_value)
+    #         # Only add if we have both input and target
+    #         if 'input_X' in raw_sample and final_recorded_value is not None:
+    #             previous_input_X = raw_sample['input_X']
+    #             previous_input_X_between_0_1 = inverse_process_candidate(previous_input_X)
+    #             print("Checking history sample input_X: ", previous_input_X)
+    #             print("Checking history sample input_X_between_0_1: ", previous_input_X_between_0_1)
+    #             print(f"Checking history sample {eval_method} at 625 steps: ", final_recorded_value)
+    #             GP_input.append(previous_input_X_between_0_1)
+    #             observed_output.append(final_recorded_value)
         
-        # We want to use the input_X that the GP suggests using the 20 historical data, instead of randomly generating one
-        # Fit GP
-        print("creating a GP: MixedSingleTaskGP")
-        discrete_dims = {
-                    len(data_domains)+1: [0,1], # modules
-                    len(data_domains)+2: [0,1],
-                    len(data_domains)+3: [0,1],
-                    len(data_domains)+4: [0,1],
-                    len(data_domains)+5: [0,1],
-                    len(data_domains)+9: [0,1] # reverse?
-                }
-        gp = MixedSingleTaskGP(torch.DoubleTensor(GP_input), torch.DoubleTensor(observed_output).reshape(-1,1), discrete_dims, outcome_transform=Standardize(m=1), input_transform=Normalize(d=len(input_X_between_0_1)))
+    #     # We want to use the input_X that the GP suggests using the 20 historical data, instead of randomly generating one
+    #     # Fit GP
+    #     print("creating a GP: MixedSingleTaskGP")
+    #     discrete_dims = {
+    #                 len(data_domains)+1: [0,1], # modules
+    #                 len(data_domains)+2: [0,1],
+    #                 len(data_domains)+3: [0,1],
+    #                 len(data_domains)+4: [0,1],
+    #                 len(data_domains)+5: [0,1],
+    #                 len(data_domains)+9: [0,1] # reverse?
+    #             }
+    #     gp = MixedSingleTaskGP(torch.DoubleTensor(GP_input), torch.DoubleTensor(observed_output).reshape(-1,1), discrete_dims, outcome_transform=Standardize(m=1), input_transform=Normalize(d=len(input_X_between_0_1)))
 
-        print("fitting GP to data since optimize_method is not random")
-        fit_gpytorch_mll(ExactMarginalLogLikelihood(gp.likelihood, gp))
+    #     print("fitting GP to data since optimize_method is not random")
+    #     fit_gpytorch_mll(ExactMarginalLogLikelihood(gp.likelihood, gp))
 
-        # Suggest next candidate
-        if BO_params["acq_function"] == "ucb":
-            acq = UpperConfidenceBound(gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5))
-        if BO_params["acq_function"] == "EI":
-            acq = LogExpectedImprovement(gp, best_f=max_performance_so_far)
-        if BO_params["optimize_method"] == "multi_fidelity":
+    #     # Suggest next candidate
+    #     if BO_params["acq_function"] == "ucb":
+    #         acq = UpperConfidenceBound(gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5))
+    #     if BO_params["acq_function"] == "EI":
+    #         acq = LogExpectedImprovement(gp, best_f=max_performance_so_far)
+    #     if BO_params["optimize_method"] == "multi_fidelity":
            
-            acq = CostScaledUCB(model=gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5), cost_fn=cost_fn)
-        if BO_params["optimize_method"] == "multi_fidelity_KG":
-            print("building KG acq function")
+    #         acq = CostScaledUCB(model=gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5), cost_fn=cost_fn)
+    #     if BO_params["optimize_method"] == "multi_fidelity_KG":
+    #         print("building KG acq function")
 
-            num_fantasies = 64
-            # base KG
-            qKG = qKnowledgeGradient(gp, num_fantasies=num_fantasies)
+    #         num_fantasies = 64
+    #         # base KG
+    #         qKG = qKnowledgeGradient(gp, num_fantasies=num_fantasies)
         
-            # get current best posterior mean
-            argmax_pmean, max_pmean = optimize_acqf(
-                acq_function=PosteriorMean(gp),
-                bounds=bounds,
-                q=1,
-                num_restarts=20,
-                raw_samples=2048,
-            )
+    #         # get current best posterior mean
+    #         argmax_pmean, max_pmean = optimize_acqf(
+    #             acq_function=PosteriorMean(gp),
+    #             bounds=bounds,
+    #             q=1,
+    #             num_restarts=20,
+    #             raw_samples=2048,
+    #         )
             
-            acq = CostScaledKG(model=gp, cost_fn=cost_fn, num_fantasies=num_fantasies, current_max_pmean=max_pmean, sampler=qKG.sampler)
+    #         acq = CostScaledKG(model=gp, cost_fn=cost_fn, num_fantasies=num_fantasies, current_max_pmean=max_pmean, sampler=qKG.sampler)
 
-        # constraints on data mixing ratio
-        A = [1.0]*len(data_domains)
-        x = list(range(len(data_domains)))
+    #     # constraints on data mixing ratio
+    #     A = [1.0]*len(data_domains)
+    #     x = list(range(len(data_domains)))
         
-        candidate = None
+    #     candidate = None
         
-        if BO_params["optimize_method"] == "mixed" or BO_params["optimize_method"] == "multi_fidelity" or  BO_params["optimize_method"] == "multi_fidelity_KG":
+    #     if BO_params["optimize_method"] == "mixed" or BO_params["optimize_method"] == "multi_fidelity" or  BO_params["optimize_method"] == "multi_fidelity_KG":
             
-            print("acq optimization method is mixed (alternating discrete and continuous)")
-            if what_to_optimize == "data": # sum to 1
-                candidate, acq_value = optimize_acqf_mixed_alternating(acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024,
-                                            equality_constraints=[(torch.tensor(x), torch.tensor(A), 1)])
-            if what_to_optimize == "model": # no constraints
-                candidate, acq_value = optimize_acqf_mixed_alternating(acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims)
+    #         print("acq optimization method is mixed (alternating discrete and continuous)")
+    #         if what_to_optimize == "data": # sum to 1
+    #             candidate, acq_value = optimize_acqf_mixed_alternating(acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024,
+    #                                         equality_constraints=[(torch.tensor(x), torch.tensor(A), 1)])
+    #         if what_to_optimize == "model": # no constraints
+    #             candidate, acq_value = optimize_acqf_mixed_alternating(acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims)
                 
-            if what_to_optimize == "both": # sum to 1 for data too
-                t_prev = time.time()
-                q=1
-                if BO_params["optimize_method"] == "multi_fidelity_KG":
-                    q = 1 + 64 # for KG, we need to add one more batch
-                    # KG cannot used mixed
-                    candidate, _ = optimize_acqf(
-                        acq_function=acq,
-                        bounds=bounds,
-                        q=q,
-                        num_restarts=20,
-                        raw_samples=1024,
-                    )
-                    candidate = candidate[0:1, :]
-                else: # normal mixed BO
-                    candidate, acq_value = optimize_acqf_mixed_alternating(acq, bounds=bounds, q=q, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims,
-                                                equality_constraints=[(torch.tensor(x), torch.tensor(A), 1)])
+    #         if what_to_optimize == "both": # sum to 1 for data too
+    #             t_prev = time.time()
+    #             q=1
+    #             if BO_params["optimize_method"] == "multi_fidelity_KG":
+    #                 q = 1 + 64 # for KG, we need to add one more batch
+    #                 # KG cannot used mixed
+    #                 candidate, _ = optimize_acqf(
+    #                     acq_function=acq,
+    #                     bounds=bounds,
+    #                     q=q,
+    #                     num_restarts=20,
+    #                     raw_samples=1024,
+    #                 )
+    #                 candidate = candidate[0:1, :]
+    #             else: # normal mixed BO
+    #                 candidate, acq_value = optimize_acqf_mixed_alternating(acq, bounds=bounds, q=q, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims,
+    #                                             equality_constraints=[(torch.tensor(x), torch.tensor(A), 1)])
                 
                 
-                t_now = time.time()
-                print(f"Time taken to perform acquisition optimization: {t_now - t_prev:.4f} seconds")
+    #             t_now = time.time()
+    #             print(f"Time taken to perform acquisition optimization: {t_now - t_prev:.4f} seconds")
                 
-                if not BO_params["optimize_method"] == "multi_fidelity_KG":
-                    # Suppose X_sampled is a tensor of shape [n_points, d]
-                    # Example: 5 random points within bounds
-                    X_sampled = torch.rand(5, bounds.shape[1]) * (bounds[1] - bounds[0]) + bounds[0]
-                    X_sampled = torch.tensor(X_sampled, dtype=torch.double)
-                    # Evaluate acquisition
-                    acq_values = acq(X_sampled.unsqueeze(1))
+    #             if not BO_params["optimize_method"] == "multi_fidelity_KG":
+    #                 # Suppose X_sampled is a tensor of shape [n_points, d]
+    #                 # Example: 5 random points within bounds
+    #                 X_sampled = torch.rand(5, bounds.shape[1]) * (bounds[1] - bounds[0]) + bounds[0]
+    #                 X_sampled = torch.tensor(X_sampled, dtype=torch.double)
+    #                 # Evaluate acquisition
+    #                 acq_values = acq(X_sampled.unsqueeze(1))
 
-                    print("Sampled points and acquisition values for multi fidelity:")
-                    for x, val in zip(X_sampled, acq_values):
-                        print(f"X = {x.tolist()}  →  acq = {val.item()}")
+    #                 print("Sampled points and acquisition values for multi fidelity:")
+    #                 for x, val in zip(X_sampled, acq_values):
+    #                     print(f"X = {x.tolist()}  →  acq = {val.item()}")
     
-            # remove last element fidelity for processing below
-            if fidelity is not None:
-                fidelity = round(candidate[0][-1].item())
-                candidate = candidate[:, :-1]
+    #         # remove last element fidelity for processing below
+    #         if fidelity is not None:
+    #             fidelity = round(candidate[0][-1].item())
+    #             candidate = candidate[:, :-1]
             
-        # if layers to apply loRA is 0, set last element to 1
-        print("proposed candidate layer mask is: ", candidate[0][-9:-4])
-        if torch.round(candidate[0][-9:-4]).sum() == 0:
-            print("proposed candidate has all zero for layer mask, adjusting to have at least one layer to apply LoRA")
-            # Set that slice to [0, 0, 0, 0, 1]
-            candidate[0][-9:-4] = torch.tensor([0, 0, 0, 0, 1], dtype=candidate[0].dtype)
+    #     # if layers to apply loRA is 0, set last element to 1
+    #     print("proposed candidate layer mask is: ", candidate[0][-9:-4])
+    #     if torch.round(candidate[0][-9:-4]).sum() == 0:
+    #         print("proposed candidate has all zero for layer mask, adjusting to have at least one layer to apply LoRA")
+    #         # Set that slice to [0, 0, 0, 0, 1]
+    #         candidate[0][-9:-4] = torch.tensor([0, 0, 0, 0, 1], dtype=candidate[0].dtype)
         
+    #     input_X_between_0_1 = list(candidate[0])
+    #     if what_to_optimize != "data":
+    #         input_X = process_candidate(candidate[0], what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max)
+    #     else:
+    #         input_X = input_X_between_0_1
+
+    #     print("input_X after fitting GP with prior data:", input_X)
+    #     print("input_X_between_0_1 after fitting GP with prior data:", input_X_between_0_1)
+    #     print("fidelity:", fidelity)
+    
+    full_evaluation_count = -1
+    
+    # -------------------------
+    # Initial random sampling phase
+    # -------------------------
+    print(f"\n=== Starting Initial Random Sampling Phase ({num_initial_random_samples} samples) ===\n")
+    for init_sample_idx in range(num_initial_random_samples):
+        print(f"\n--- Initial Sample {init_sample_idx + 1}/{num_initial_random_samples} ---")
+        
+        # Generate random configuration
+        input_X, input_X_between_0_1, sample_fidelity = randomly_generate_data(
+            what_to_optimize, data_domains, lora_max_num_layers, 
+            lora_rank_max, BO_params, seed=None
+        )
+        
+        _, _, discrete_dims = get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_num_layers, default_lora_config, sample_fidelity) # just to print the generated config in a more readable way
+        
+        # Evaluate this configuration
+        observed_perf, realized_perf, _ = evaluate_single_configuration(
+            input_X=input_X,
+            fidelity=sample_fidelity,
+            what_to_optimize=what_to_optimize,
+            data_domains=data_domains,
+            lora_max_num_layers=lora_max_num_layers,
+            lora_rank_max=lora_rank_max,
+            default_lora_config=default_lora_config,
+            model_id=model_id,
+            train_datasets=train_datasets,
+            val_datasets=val_datasets,
+            all_sampled_evaluation_data=all_sampled_evaluation_data,
+            total_number_datapoints=total_number_datapoints,
+            sampling_method=sampling_method,
+            train_epochs=train_epochs,
+            training_batch=training_batch,
+            max_steps=max_steps,
+            eval_steps=eval_steps,
+            evaluation_task=evaluation_task,
+            eval_method=eval_method,
+            evaluation_batch=evaluation_batch,
+            num_eval_samples=num_eval_samples,
+            time_callback=time_callback,
+            seed=seed,
+        )
+        
+        # Update max performance
+        max_performance_so_far = max(max_performance_so_far, realized_perf)
+        
+        # Record in GP observations
+        gp_input_current = input_X_between_0_1.copy() if isinstance(input_X_between_0_1, list) else input_X_between_0_1[:]
+        if sample_fidelity is not None:
+            gp_input_current.append(sample_fidelity)
+            all_fidelity_levels.append(sample_fidelity)
+        
+        GP_input.append(gp_input_current)
+        full_input.append(input_X)
+        observed_output.append(observed_perf)
+        full_train_results_list.append(realized_perf)
+        results_list.append(realized_perf)
+        
+        print(f"Initial sample {init_sample_idx + 1} - Observed: {observed_perf}, Realized: {realized_perf}")
+    
+    print(f"\n=== Initial Sampling Complete. Starting BO Loop ===\n")
+    
+    # Now fit GP and suggest first BO candidate
+    if len(GP_input) > 0:
+        candidate, fidelity, gp = fit_GP_and_suggest_next_candidate(
+            GP_input, observed_output, fidelity if fidelity is not None else None, 
+            what_to_optimize, BO_params, max_performance_so_far, bounds, cost_fn, 
+            data_domains, discrete_dims if 'discrete_dims' in locals() else {}, 
+            itr, lora_max_num_layers, lora_rank_max
+        )
+        
+        # Process candidate for next iteration
         input_X_between_0_1 = list(candidate[0])
         if what_to_optimize != "data":
             input_X = process_candidate(candidate[0], what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max)
         else:
             input_X = input_X_between_0_1
-
-        print("input_X after fitting GP with prior data:", input_X)
-        print("input_X_between_0_1 after fitting GP with prior data:", input_X_between_0_1)
-        print("fidelity:", fidelity)
     
-    full_evaluation_count = -1
     while itr < BO_run:
         print("\n\n\n")
         print("======== BO iteration: ", itr, " ==========")
@@ -1008,16 +1229,7 @@ def joint_opt_BO_LLM_generalized(
         lora_config = None
         discrete_dims = None
         
-        # print the current iteration proposed candidate in a more readable way
-        print_inputs(input_X, data_domains, what_to_optimize)
-        lora_config, mixing_ratio, discrete_dims = get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_num_layers, default_lora_config, fidelity)
-        
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
-        
         # increment iteration count and update progress bar.
-        # If lower fidelity is requested, we increment the iteration
-        # by a smaller amount because "less optimizationbudget" is used.
         if fidelity is not None:
             if fidelity == 0.0:
                 print("lower fidelity requested")
@@ -1030,72 +1242,61 @@ def joint_opt_BO_LLM_generalized(
                 pbar.update(1)
                 count_high_fidelity += 1
         else:
-            if BO_params["to_apply_joBS"]:
-                itr += 0.1
-                pbar.update(0.1)
-            else:
-                itr +=1
-                pbar.update(1)
+            itr +=1
+            pbar.update(1)
             count_high_fidelity += 1
         
+        # print the current iteration proposed candidate in a more readable way
+        print_inputs(input_X, data_domains, what_to_optimize)
         
-        # generate callback if predictor is used to extrapolate training performance
+        lora_config, mixing_ratio, discrete_dims = get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_num_layers, default_lora_config, fidelity)
+        
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+          
+        # generate callback if predictor is used
+        callbacks_list = [time_callback]
         if eval_method == "performance":
             full_evaluation_count += 1
             class PerformanceEvalCallback(TrainerCallback):
-                """
-                A custom callback to run lm_eval.simple_evaluate specifically at steps 25 and 50.
-                Performance metrics are logged to trainer.state.log_history for easy retrieval.
-                """
                 def __init__(self, tokenizer, eval_tasks):
                     self.tokenizer = tokenizer
-                    # Fixed evaluation steps as requested
                     self.target_eval_steps = {25, 50, 75, 100} 
                     self.eval_tasks = eval_tasks
-                    # To store results temporarily before logging
                     self.step_performances = {} 
-                    print(f"Initialized PerformanceEvalCallback to evaluate only at steps {self.target_eval_steps} for tasks: {eval_tasks}")
 
                 def _evaluate_performance(self, model, trainer, current_step):
-                    # Get performance from lm_eval
                     print(f"Running evaluation for step {current_step}...")
                     model.eval()
                     results = evaluate_tasks(list(self.eval_tasks.keys()), model, self.tokenizer, batch=8, few_shot=3, limit=num_eval_samples)
                     model.train()
                     
-                    # Extract the specific metric value
                     performance = None
                     for task, value in self.eval_tasks.items():
                         _, metric = value
                         performance = results["results"][task][metric]
-                        break # Assuming we want the first task/metric found if multiple are passed
+                        break
                         
                     print(f"Evaluation performance at step {current_step}: {performance}")
                     return performance
 
                 def on_step_end(self, args, state, control, **kwargs):
-                    """
-                    Called at the end of every training step. 
-                    Checks if current step is 25 or 50, evaluates, and stores the result.
-                    """
                     if state.global_step in self.target_eval_steps:
                         performance = self._evaluate_performance(kwargs.get('model'), kwargs.get('trainer'), state.global_step)
-                        
-                        # Store with a specific key for retrieval later
                         key_name = f"performance_step_{state.global_step}"
                         self.step_performances[key_name] = performance
 
             performance_eval_callback = PerformanceEvalCallback(tokenizer, evaluation_task)
+            callbacks_list.append(performance_eval_callback)
         
-        # Train & evaluate with the given data mixture and lora configurations
-        # Note that even if we are using low-fidelity observations, we still train to completion for evaluation purposes.
+        # Train & evaluate
         train_results = extract_data_mixture_and_train(
             model=model,
             tokenizer=tokenizer,
             train_datasets=train_datasets,
             val_datasets=val_datasets,
             data_domains=data_domains,
-            evaluation_dataset=all_sampled_evaluation_data, # evaluation data
+            evaluation_dataset=all_sampled_evaluation_data,
             mixing_ratio=mixing_ratio,
             additional_info=all_influences,
             total_number_datapoints=total_number_datapoints,
@@ -1105,81 +1306,50 @@ def joint_opt_BO_LLM_generalized(
             max_step=max_steps,
             lora_config=lora_config,
             eval_steps=eval_steps,
-            callback=[time_callback, performance_eval_callback] if eval_method == "performance" else [time_callback],
+            callback=callbacks_list,
             seed=seed
         )
 
         observed_performance, realized_performance = evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, num_eval_samples)
-            
-        # transform observed_performance (or eval_loss_trajectory) into a new observed_performance
-        # with some variant of a predictor/extrapolator
-        if BO_params["to_apply_joBS"]:
-            
-            print(f"Applying JoBS: Extracted {eval_method} logs for performance prediction.")
-            print("Full train results log history: ", train_results)
-            
-            # Extract first two (training steps 25 and 50) to use for predictor
-            if eval_method == "eval_loss":
-                recorded_values = train_results.get(eval_method, []) # loss
-                realized_performance *= (1/scaling_weight)
-            else: # it's performance
-                # {'performance_step_25': 0.62, 'performance_step_50': 0.59}
-                # take max of realized_performance and the values in this dict
-                realized_performance *= scaling_weight
-                realized_performance = max(realized_performance, max(train_results["step_performances"].values()))
-                # best possible performance
-                recorded_values = list(train_results["step_performances"].values())
-                print("recorded performance values for JoBS predictor: ", recorded_values)
-                
-            if len(recorded_values) >= 2:
-                value_25 = recorded_values[0]
-                value_50 = recorded_values[1]
-                value_75 = recorded_values[2]
-                value_100 = recorded_values[3]
-                
-                loss_input = [25, value_25, 50, value_50, 75, value_75, 100, value_100, 625]
-                input = input_X + loss_input
-                input_tensor = torch.tensor([input], dtype=torch.float32)
-                with torch.no_grad():
-                    predicted_final_value = predictor_model(input_tensor).item()
-                    print("predicted final value from JoBS predictor: ", predicted_final_value)
-                    if eval_method == "performance":
-                        observed_performance = predicted_final_value
-                    elif eval_method == "eval_loss":
-                        observed_performance = -predicted_final_value
-            
+        
         # max performance
         max_performance_so_far = max(max_performance_so_far, realized_performance)
         full_train_results_list.append(realized_performance)
         results_list.append(realized_performance)
         
-        print(f"current iteration observed (possibly low-fid or predicted) {eval_method}: ", observed_performance)
-        print(f"current iteration best possible {eval_method} (full train run): ", realized_performance)
+        print(f"current iteration observed {eval_method}: ", observed_performance)
+        print(f"current iteration realized {eval_method}: ", realized_performance)
         print(f"max {eval_method} so far: ", max_performance_so_far)
-        print("BO observations: ", results_list)
         
-        # append fidelity to current inputs to GP here if fidelity is given
+        # Create a copy for GP input to avoid modifying original
+        gp_input_current = input_X_between_0_1.copy() if isinstance(input_X_between_0_1, list) else input_X_between_0_1[:]
+        
+        # append fidelity if needed
         if fidelity is not None:
-            input_X_between_0_1.append(fidelity)
+            gp_input_current.append(fidelity)
             all_fidelity_levels.append(fidelity)
         
-        # update observation and current inputs to historical data
-        GP_input.append(input_X_between_0_1)
+        # update observations
+        GP_input.append(gp_input_current)
         full_input.append(input_X)
         observed_output.append(observed_performance)
         
         # suggest next candidate
-        candidate, next_fidelity, gp = fit_GP_and_suggest_next_candidate(GP_input, observed_output, fidelity, what_to_optimize, BO_params, max_performance_so_far, bounds, cost_fn, data_domains, discrete_dims, itr, lora_max_num_layers, lora_rank_max)
+        candidate, next_fidelity, gp = fit_GP_and_suggest_next_candidate(
+            GP_input, observed_output, fidelity, what_to_optimize, BO_params, 
+            max_performance_so_far, bounds, cost_fn, data_domains, discrete_dims, 
+            itr, lora_max_num_layers, lora_rank_max
+        )
         
-        # The following is no longer needed because we are now handling the inequality constraints during acquisition optimization.
-        # Hence, the candidate suggested will not have all zero for layer mask. We keep this code here just in case for debugging
-        # The printout SHOULD NOT appear.
+        # Update bounds for next iteration if fidelity changes
+        if next_fidelity != fidelity:
+            lower_bound, upper_bound = generate_bounds(what_to_optimize, data_domains, lora_max_num_layers, lora_rank_max, next_fidelity)
+            bounds = torch.stack([torch.DoubleTensor(lower_bound), torch.DoubleTensor(upper_bound)])
+        
+        # Check layer mask constraint
         if what_to_optimize != "data":    
-            # if layers to apply loRA is 0, set last element to 1
-            print("proposed candidate layer mask is: ", candidate[0][-9:-4])
             if torch.round(candidate[0][-9:-4]).sum() == 0:
-                print("proposed candidate has all zero for layer mask, adjusting to have at least one layer to apply LoRA")
-                # Set that slice to [0, 0, 0, 0, 1]
+                print("WARNING: Candidate has all zero for layer mask, adjusting...")
                 candidate[0][-9:-4] = torch.tensor([0, 0, 0, 0, 1], dtype=candidate[0].dtype)
         
         input_X_between_0_1 = list(candidate[0])
