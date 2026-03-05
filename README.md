@@ -61,6 +61,7 @@ ACQ_FUNCS=("ucb" "EI")
 EVAL_METHODS=("eval_loss" "performance")
 RUN_BO_ON_OPTIONS=("model" "data" "both")
 MODELS=("llama-8b" "qwen-7b")
+TRAINING_TASKS_OPTIONS=("ALL" "triviaqa,truthfulqa_gen,gsm8k,commonsense_qa,arc_challenge")
 
 # evaluation tasks
 TASKS=("arc_challenge" "triviaqa,truthfulqa_gen")
@@ -83,7 +84,11 @@ The sweep variables control what experiments we run.
     - `data`: optimize training data mixture
     - `both`: optimize both
 - `MODELS` indicates the model that we are optimizing. We support `llama-8b`, `qwen-7b`, `qwen-14b`, qwen-14b right now.
+- `TRAINING_TASKS_OPTIONS` is the most fun part. You can indicate what training data domain to look at.
+    - `ALL` means we consider the entire training data domains (10 for now), and optimize it to find the best mixture
+    - `triviaqa,truthfulqa_gen,gsm8k,commonsense_qa,arc_challenge` means we consider 5 training data domains, and so we are optimizing a 5 dimensional data mixture.
 - `TASKS` indicates what downstream evaluation task is evaluated. For example, `"arc_challenge"` indicates the `arc_challenge` task alone is evaluated. `"triviaqa,truthfulqa_gen"` indicates both tasks will be evaluated with a 50:50 weightage.
+- Hence, `TRAINING_TASKS_OPTIONS` and `TASKS` allow you to play with different combination of training domains and target evaluation task.
 
 **Each variable takes in a space-separated tuple, and we sweep through the variables (in a for loop) and run experiments for every combination of variables.**
 So, you can add in a bunch of options separated by a white space (see the example segment of variables above) and the script will repeat the optimization for every single combination of variable.
