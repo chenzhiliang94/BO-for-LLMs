@@ -1,6 +1,7 @@
 # Introduction
 This repository contains various toolkits to run Bayesian Optimization for various LLM applications. Bayesian Optimization (BO) is an iterative algorithm used to optimize black-box functions. These black functions have no analytical form and evaluating each function value is expensive. BO has become a popular method to optimize various training ingredients of LLMs.
 
+(Click on the "play" button in the gif top right corner to play it)
 ![eval_gsm8k_loss_but_expected](https://github.com/user-attachments/assets/55583fab-5a95-4eea-aaac-bb8ddedd9a1c)
 
 
@@ -36,10 +37,10 @@ Our ICLR 2026 paper https://arxiv.org/abs/2502.00270 uses BO to optimize data mi
 }
 ```
 
-Given a downstream task of `gsm8k` and **the performance as the task loss**, our algorithm eventually infers that it's best to use 100% of gsm8k data to get the best downstream task loss (without knowing the downstreeam task is gsm8k).
+Given a downstream task of `gsm8k` and **the performance as the task loss**, our algorithm eventually infers that it's best to use 100% of gsm8k data to get the best downstream task loss (without knowing the downstreeam task is gsm8k). (Click on the "play" button in the gif top right corner to play it)
 ![eval_gsm8k_loss_but_expected](https://github.com/user-attachments/assets/55583fab-5a95-4eea-aaac-bb8ddedd9a1c)
 
-An interesting phenomenon happens if we instead consider **the performance as the task performance (e.g., accuracy over gsm8k questions)**. Somehow the algorithm eventually decides that using a big portion of TriviaQA and CommonsenseQA dataset leads to the best downstream gsm8k performance!
+An interesting phenomenon happens if we instead consider **the performance as the task performance (e.g., accuracy over gsm8k questions)**. Somehow the algorithm eventually decides that using a big portion of TriviaQA and CommonsenseQA dataset leads to the best downstream gsm8k performance! (Click on the "play" button in the gif top right corner to play it)
 ![eval_gsm8k_performance_but_weird](https://github.com/user-attachments/assets/ee27b3d7-c9be-4f63-ad83-ba91932a208f)
 
 
