@@ -13,7 +13,7 @@ TRIALS=1
 EXP_SETTING=in_dist
 TIME_LIMIT=1000
 LORA_RANK=128
-NUM_EVAL_SAMPLES=500
+NUM_EVAL_SAMPLES=200
 TRAIN_BATCH=40
 EVAL_BATCH=40
 OUTPUT_DIR=results
@@ -25,14 +25,14 @@ UCB_BETA=20
 # Sweep variables
 # ----------------------- #
 OPT_METHODS=("mixed")
-ACQ_FUNCS=("ucb")
-EVAL_METHODS=("performance")
+ACQ_FUNCS=("ei")
+EVAL_METHODS=("performance" "eval_loss")
 RUN_BO_ON_OPTIONS=("data")
-MODELS=("llama-8b" "qwen-7b")
+MODELS=("llama-8b")
 TRAINING_TASKS_OPTIONS=("triviaqa,truthfulqa_gen,gsm8k,commonsense_qa,arc_challenge" )
 
 # evaluation tasks
-TASKS=("commonsense_qa,truthfulqa_gentriviaqa" "triviaqa" "truthfulqa_gen" "commonsense_qa")
+TASKS=("commonsense_qa,truthfulqa_gen,triviaqa" "triviaqa" "commonsense_qa")
 
 # Track failures
 FAILED_JOBS=()
