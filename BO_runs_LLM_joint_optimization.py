@@ -141,6 +141,7 @@ sample_method = "random"
 results = []
 full_inputs_results = []
 full_train_performance_results = []
+all_intermediate_results_per_trial = []
 for x in range(trials):
     
     rng = random.Random()
@@ -180,7 +181,7 @@ for x in range(trials):
                 control.should_training_stop = True
             return control
 
-    GP_input, full_inputs, observed_output, gp, all_fidelity_levels, full_train_performance = joint_opt_BO_LLM_generalized(default_lora_config=default_lora_config, 
+    GP_input, full_inputs, observed_output, gp, all_fidelity_levels, full_train_performance, all_intermediate_results = joint_opt_BO_LLM_generalized(default_lora_config=default_lora_config, 
                                                                     time_callback=TimerCallback(time_limit),
                                                                     lora_rank_max=lora_rank,
                                                                     data_domains = data_domains,
@@ -218,6 +219,7 @@ for x in range(trials):
     ]
     full_inputs_results.append(full_inputs)
     full_train_performance_results.append(full_train_performance)
+    all_intermediate_results_per_trial.append(all_intermediate_results)
 final_info_stored["best_seen_performance"] = results
 final_info_stored["inputs_iterated"] = full_inputs_results
 final_info_stored["train_performance"] = full_train_performance
@@ -233,7 +235,8 @@ output_data = {
     "final_info_stored": final_info_stored,
     "full_training_run_performance": full_train_performance,
     "BO_params": BO_params,
-    "fidelity_levels": all_fidelity_levels
+    "fidelity_levels": all_fidelity_levels,
+    "intermediate_results": all_intermediate_results_per_trial
 }
 
 # Define a path to save the JSON file

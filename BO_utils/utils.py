@@ -1,3 +1,4 @@
+import os
 import torch
 import random
 import numpy as np
@@ -73,11 +74,16 @@ def randomly_generate_data(
     BO_params: dict,
     seed: int | None = None
 ) -> tuple[List[float], List[float], int | None]:
-    """Randomly generate a BO candidate configuration.
+    """Generate a BO candidate configuration using a scrambled Sobol sequence.
+
+    Uses a low-discrepancy Sobol quasi-random sequence instead of
+    pseudo-random sampling, giving better space-filling coverage of the
+    search space — especially beneficial for the initial design phase
+    of Bayesian Optimisation.
 
     Depending on ``what_to_optimize``, generates either data mixing ratios
-    (Dirichlet sample), LoRA hyper-parameters (num_layers, module mask,
-    rank, dropout, alpha, reverse), or both.  Also randomly picks a
+    (mapped from Sobol via inverse-exponential → normalised, equivalent to
+    Dirichlet(1,…,1)), LoRA hyper-parameters, or both.  Also picks a
     fidelity level when the optimisation method requires it.
 
     Args:
@@ -86,97 +92,105 @@ def randomly_generate_data(
         lora_max_num_layers: Maximum number of model layers available for LoRA.
         lora_rank_max: Maximum LoRA rank.
         BO_params: Bayesian Optimisation config dict (must contain ``"optimize_method"``).
-        seed: Optional random seed for reproducibility; ``None`` for non-deterministic.
+        seed: Scramble seed for the Sobol engine.  Different seeds produce
+            different scrambled sequences.  ``None`` uses a random scramble.
 
     Returns:
         input_X: Actual parameter values.
         input_X_between_0_1: Parameters normalised to [0, 1].
         fidelity: Randomly chosen fidelity level (0 or 1), or ``None`` for single-fidelity.
     """
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-    else:
-        random.seed()
-        np.random.seed()
+    from torch.quasirandom import SobolEngine
+
+    # ── Determine total Sobol dimension ──────────────────────────────
+    k = len(data_domains)
+    model_dims = 10  # num_layers(1) + mask(5) + rank(1) + dropout(1) + alpha(1) + reverse(1)
+
     if what_to_optimize == "data":
-        k = len(data_domains)
-        input_X = np.random.dirichlet([1.0] * k).tolist()
-        input_X_between_0_1 = input_X[:] # already between 0 and 1
-        
+        dim = k
     elif what_to_optimize == "model":
-        # num_layers_to_apply
-        num_layers = random.randint(1, lora_max_num_layers)
-        input_X = [num_layers]
-        input_X_between_0_1 = [num_layers / lora_max_num_layers]
+        dim = model_dims
+    else:  # "both"
+        dim = k + model_dims
 
-        # random mask of 0/1 for 5 layers
-        mask = sample_random_mask(5)
-        input_X += mask
-        input_X_between_0_1 += mask
+    needs_fidelity = BO_params["optimize_method"] in (
+        "multi_fidelity", "multi_fidelity_KG"
+    )
+    if needs_fidelity:
+        dim += 1
 
-        # rank
-        rank = random.randint(1, lora_rank_max)
-        input_X.append(rank)
-        input_X_between_0_1.append(rank / lora_rank_max)
+    # ── Draw one Sobol point in [0, 1)^dim ───────────────────────────
+    # Use os.urandom instead of random.randint so that the seed is not
+    # affected by random.seed() calls from training libraries (e.g.
+    # transformers.set_seed), which would reset Python's random state and
+    # cause identical scramble seeds on every subsequent call.
+    scramble_seed = seed if seed is not None else int.from_bytes(os.urandom(4), 'big') % (2**31)
+    print("scramble seed: ", scramble_seed)
+    engine = SobolEngine(dimension=dim, scramble=True, seed=scramble_seed)
+    raw = engine.draw(1).squeeze(0).numpy()  # shape (dim,)
 
-        # dropout
-        dropout = random.uniform(0.0, 0.1)   # adjust domain if needed
-        input_X.append(dropout)
-        input_X_between_0_1.append(dropout / 0.1)
+    input_X: List[float] = []
+    input_X_between_0_1: List[float] = []
+    idx = 0  # running index into `raw`
 
-        # alpha
-        alpha = random.randint(1, 48)
-        input_X.append(alpha)
-        input_X_between_0_1.append(alpha / 48)
+    # ── Data mixing ratios (Dirichlet(1,…,1) via inverse Exp CDF) ────
+    if what_to_optimize in ("data", "both"):
+        u = raw[idx : idx + k]
+        # Inverse CDF of Exponential(1): -log(1 - u), then normalise
+        exp_vals = -np.log(1.0 - u + 1e-10)
+        mix = (exp_vals / exp_vals.sum()).tolist()
+        input_X.extend(mix)
+        input_X_between_0_1.extend(mix)  # already in [0, 1]
+        idx += k
 
-        # reverse
-        reverse = random.choice([0, 1])
-        input_X.append(reverse)
-        input_X_between_0_1.append(reverse)
-    else: # optimize both
-        
-        # data mixture
-        k = len(data_domains)
-        input_X = np.random.dirichlet([1.0] * k).tolist()
-        input_X_between_0_1 = input_X[:] # already between 0 and 1
-        
-        # num_layers_to_apply
-        num_layers = random.randint(1, lora_max_num_layers)
+    # ── Model hyper-parameters ───────────────────────────────────────
+    if what_to_optimize in ("model", "both"):
+        # num_layers_to_apply: [0,1) → {1, …, lora_max_num_layers}
+        num_layers = min(lora_max_num_layers, int(raw[idx] * lora_max_num_layers) + 1)
         input_X.append(num_layers)
         input_X_between_0_1.append(num_layers / lora_max_num_layers)
+        idx += 1
 
-        # random mask of 0/1 for 5 layers
-        mask = sample_random_mask(5)
-        input_X += mask
-        input_X_between_0_1 += mask
+        # module mask: 5 binary values, threshold at 0.5
+        mask = [1 if raw[idx + i] >= 0.5 else 0 for i in range(5)]
+        if sum(mask) == 0:
+            mask[-1] = 1  # guarantee at least one module
+        input_X.extend(mask)
+        input_X_between_0_1.extend(mask)
+        idx += 5
 
-        # rank
-        rank = random.randint(1, lora_rank_max)
+        # rank: [0,1) → {1, …, lora_rank_max}
+        rank = min(lora_rank_max, int(raw[idx] * lora_rank_max) + 1)
         input_X.append(rank)
         input_X_between_0_1.append(rank / lora_rank_max)
+        idx += 1
 
-        # dropout
-        dropout = random.uniform(0.0, 0.1)
+        # dropout: [0,1) → [0, 0.1]
+        dropout = round(float(raw[idx]) * 0.1, 4)
         input_X.append(dropout)
         input_X_between_0_1.append(dropout / 0.1)
+        idx += 1
 
-        # alpha
-        alpha = random.randint(1, 48)
+        # alpha: [0,1) → {1, …, 48}
+        alpha = min(48, int(raw[idx] * 48) + 1)
         input_X.append(alpha)
         input_X_between_0_1.append(alpha / 48)
+        idx += 1
 
-        # reverse
-        reverse = random.choice([0, 1])
+        # reverse: binary, threshold at 0.5
+        reverse = 1 if raw[idx] >= 0.5 else 0
         input_X.append(reverse)
         input_X_between_0_1.append(reverse)
-        
+        idx += 1
+
+    # ── Fidelity ─────────────────────────────────────────────────────
     fidelity = None
-    if BO_params["optimize_method"] == "multi_fidelity" or BO_params["optimize_method"] == "multi_fidelity_KG":
-        fidelity = random.choice([0, 1])
-        print("fidelity is required. Randomly generating fidelity: ", fidelity)
+    if needs_fidelity:
+        fidelity = 1 if raw[idx] >= 0.5 else 0
+        print("fidelity is required. Sobol-generated fidelity:", fidelity)
     else:
         print("fidelity is not required")
+
     return input_X, input_X_between_0_1, fidelity
 
 def print_inputs(
