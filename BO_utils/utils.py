@@ -113,9 +113,7 @@ def randomly_generate_data(
     else:  # "both"
         dim = k + model_dims
 
-    needs_fidelity = BO_params["optimize_method"] in (
-        "multi_fidelity", "multi_fidelity_KG"
-    )
+    needs_fidelity = BO_params["optimize_method"] == "multi_fidelity"
     if needs_fidelity:
         dim += 1
 

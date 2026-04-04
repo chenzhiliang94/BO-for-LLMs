@@ -51,6 +51,9 @@ parser.add_argument("--optimize_method", help="BO optimization method")
 parser.add_argument("--acq_function", help="acquisition function")
 parser.add_argument("--ucb_beta", help="UCB beta parameter", type=float, default=10.0)
 parser.add_argument("--iterations", help="number of BO iterations", type=int, default=50)
+parser.add_argument("--cost_scale_mf", help="cost scale for multi-fidelity BO", type=float, default=10) # high fidelity is penalized by 10
+parser.add_argument("--early_train_steps", help="how short is small fidelity", type=int, default=100) # 100 = 100 training steps
+parser.add_argument("--num_initial_random_samples", help="number of initial random samples before BO starts", type=int, default=10)
 
 # random configs
 parser.add_argument("--eval_random_config", help="if specified, evaluate random configs", action="store_true")
@@ -131,9 +134,12 @@ final_info_stored = {"command line args": args,
 BO_params = {
     "acq_function": acq_function, # either "ucb" or "EI"
     "ucb_beta": ucb_beta,
-    "optimize_method": optimize_method, # either "mixed" or "standard" or "multi_fidelity" or "multi_fidelity_KG"
+    "optimize_method": optimize_method, # either "mixed" or "multi_fidelity"
+    "use_JoBS": to_apply_joBS,
     "to_apply_joBS": to_apply_joBS,
-    "BO_iterations": BO_iterations
+    "BO_iterations": BO_iterations,
+    "cost_scale_mf": int(args["cost_scale_mf"]),
+    "early_train_steps": int(args["early_train_steps"])
 }
 
 # how to form the data mixture
@@ -145,7 +151,7 @@ all_intermediate_results_per_trial = []
 for x in range(trials):
     
     rng = random.Random()
-    seed = rng.randint(0, 1000)
+    seed = int(args["seed"])
     
     # if we are only optimizing data mixtures, the default lora configuration is read from the json file and fixed.
     config_path = os.path.join(os.path.dirname(__file__), "configuration", "default_lora_configuration.json")
@@ -199,7 +205,7 @@ for x in range(trials):
                                                                     model_id=model_id,
                                                                     what_to_optimize=run_BO_on,
                                                                     data_cache_dir=data_cache_dir,
-                                                                    num_initial_random_samples=10)
+                                                                    num_initial_random_samples=int(args["num_initial_random_samples"]))
 
     current_max = float('-inf')  # Start with negative infinity
     max_until_now = []           # List to store max values at each step

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 export TQDM_DISABLE=1
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=6
 
 # ----------------------- #
 # Shared configuration
@@ -9,30 +9,32 @@ export CUDA_VISIBLE_DEVICES=2
 ITER=50
 NUM_DATA=10000
 EPOCHS=1
-TRIALS=1
+TRIALS=2
 EXP_SETTING=in_dist
-TIME_LIMIT=1000
+TIME_LIMIT=100
 LORA_RANK=128
 NUM_EVAL_SAMPLES=200
-TRAIN_BATCH=40
-EVAL_BATCH=40
-OUTPUT_DIR=results
+TRAIN_BATCH=36
+EVAL_BATCH=36
+RESULTS_ROOT=results
 PRINTOUT_DIR=printouts
 USE_JOBS=0
 UCB_BETA=20
+COST_SCALE_MF=1
+NUM_INITIAL_RANDOM_SAMPLES=10
 
 # ----------------------- #
 # Sweep variables
 # ----------------------- #
 OPT_METHODS=("mixed")
-ACQ_FUNCS=("ei")
-EVAL_METHODS=("performance" "eval_loss")
-RUN_BO_ON_OPTIONS=("data")
+ACQ_FUNCS=("ucb")
+EVAL_METHODS=("eval_loss")
+RUN_BO_ON_OPTIONS=("both")
 MODELS=("llama-8b")
-TRAINING_TASKS_OPTIONS=("triviaqa,truthfulqa_gen,gsm8k,commonsense_qa,arc_challenge" )
+TRAINING_TASKS_OPTIONS=("truthfulqa_gen,commonsense_qa,mmlu,triviaqa,gsm8k,arc_challenge")
 
 # evaluation tasks
-TASKS=("commonsense_qa,truthfulqa_gen,triviaqa" "triviaqa" "commonsense_qa")
+TASKS=( "triviaqa" "arc_challenge" "commonsense_qa" "mmlu" "truthfulqa_gen" "gsm8k")
 
 # Track failures
 FAILED_JOBS=()
@@ -40,7 +42,6 @@ FAILED_JOBS=()
 # ----------------------- #
 # Create output directories
 # ----------------------- #
-mkdir -p "$OUTPUT_DIR"
 mkdir -p "$PRINTOUT_DIR"
 
 # ----------------------- #
@@ -55,16 +56,27 @@ run_job() {
     local run_bo_on=$5
     local model=$6
     local training_tasks=$7
-    local seed=13549
+    local seed=12345
 
-    # create a random run id with random
-    run_id=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 8)
+    # Output dir based on what BO optimizes: results_both, results_model, results_data
+    local output_dir="${RESULTS_ROOT}_${run_bo_on}"
+    mkdir -p "$output_dir"
 
-    INFO_PRINTOUT="${opt_method}_acq_${acq_func}_eval_${eval_method}_bo_${run_bo_on}_run_id_${run_id}"
-    SAVE_NAME="${model}_${acq_func}_${INFO_PRINTOUT}.json"
-    LOG_FILE="${PRINTOUT_DIR}/${model}_${acq_func}_${task}_${INFO_PRINTOUT}.out"
+    # Log dir with run_bo_on subdirectory
+    local log_dir="${PRINTOUT_DIR}/${run_bo_on}"
+    mkdir -p "$log_dir"
+
+    SAVE_NAME="${model}_${acq_func}_${opt_method}_eval_${eval_method}_seed_${seed}.json"
+    LOG_FILE="${log_dir}/${model}_${acq_func}_${task}_${opt_method}_eval_${eval_method}_seed_${seed}.out"
+
+    # Skip if results file already exists
+    if [ -f "${output_dir}/${task//,/_}/${SAVE_NAME}" ]; then
+        echo "⏭️  SKIP (already exists): ${output_dir}/${task//,/_}/${SAVE_NAME}"
+        return 0
+    fi
 
     echo "==============================================="
+    echo "CUDA=$CUDA_VISIBLE_DEVICES"
     echo "MODEL=$model"
     echo "RUN_BO_ON=$run_bo_on"
     echo "TASK=$task"
@@ -72,13 +84,12 @@ run_job() {
     echo "OPT_METHOD=$opt_method"
     echo "ACQ_FUNC=$acq_func"
     echo "EVAL_METHOD=$eval_method"
+    echo "NUM_INITIAL_RANDOM_SAMPLES=$NUM_INITIAL_RANDOM_SAMPLES"
     echo "OUTPUT AT ${LOG_FILE}"
-    # the task, make it comma separated into separated by _
-    # and add it to the print here
-    echo "RESULTS WILL BE SAVED AT ${OUTPUT_DIR}/${task//,/_}/${SAVE_NAME}"
+    echo "RESULTS WILL BE SAVED AT ${output_dir}/${task//,/_}/${SAVE_NAME}"
     echo "==============================================="
 
-    python3 -u BO_runs_LLM_joint_optimization.py \
+    nohup python3 -u BO_runs_LLM_joint_optimization.py \
         --iterations=$ITER \
         --num_data=$NUM_DATA \
         --epochs=$EPOCHS \
@@ -98,8 +109,10 @@ run_job() {
         --model=$model \
         --JoBS=$USE_JOBS \
         --ucb_beta=$UCB_BETA \
+        --cost_scale_mf=$COST_SCALE_MF \
         --optimize_method=$opt_method \
-        --output_dir=$OUTPUT_DIR \
+        --num_initial_random_samples=$NUM_INITIAL_RANDOM_SAMPLES \
+        --output_dir=$output_dir \
         --save_name="$SAVE_NAME" \
         > "$LOG_FILE" 2>&1
 
@@ -119,6 +132,20 @@ run_job() {
 # ----------------------- #
 # Sweep loop
 # ----------------------- #
+
+echo "==============================================="
+echo "Sweep Configuration"
+echo "==============================================="
+echo "OPT_METHODS: ${OPT_METHODS[*]}"
+echo "ACQ_FUNCS: ${ACQ_FUNCS[*]}"
+echo "EVAL_METHODS: ${EVAL_METHODS[*]}"
+echo "RUN_BO_ON: ${RUN_BO_ON_OPTIONS[*]}"
+echo "MODELS: ${MODELS[*]}"
+echo "TRAINING_TASKS: ${TRAINING_TASKS_OPTIONS[*]}"
+echo "EVAL_TASKS: ${TASKS[*]}"
+echo "ITERATIONS: $ITER | TRIALS: $TRIALS | SEED: 13549"
+echo "==============================================="
+echo ""
 
 for model in "${MODELS[@]}"; do
     for run_bo_on in "${RUN_BO_ON_OPTIONS[@]}"; do
@@ -141,7 +168,7 @@ done
 # ----------------------- #
 
 echo "==============================================="
-echo "Unit Test Summary"
+echo "Summary"
 echo "==============================================="
 
 if [ ${#FAILED_JOBS[@]} -eq 0 ]; then
