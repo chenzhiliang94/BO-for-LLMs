@@ -61,7 +61,6 @@ def get_model_and_predict(X):
         return pred
     
 def get_tokenizer_and_model(model_id = "LLM/llama_8b_instruct"):
-
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # adjust tokenizer (from alpaca repo, MIGHT NOT BE NEEDED IDK)
     tokenizer.pad_token_id = (
@@ -537,7 +536,9 @@ def train(model, tokenizer, train_dataset, val_dataset, train_epochs=1, batch_si
     model.is_parallelizable = False
     model.model_parallel = False
     
-    transformers.set_seed(42)
+    run_seed = int.from_bytes(os.urandom(8), 'big') % (2**32)
+    transformers.set_seed(run_seed)
+    print(f"Training run seed: {run_seed}")
     model.train()
 
     trainer = transformers.Trainer(

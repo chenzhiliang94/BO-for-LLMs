@@ -1,41 +1,66 @@
 from botorch.acquisition import AcquisitionFunction
 from botorch.acquisition.knowledge_gradient import qKnowledgeGradient
 from botorch.acquisition.analytic import LogExpectedImprovement, UpperConfidenceBound, PosteriorMean
+from botorch.acquisition.max_value_entropy_search import qMaxValueEntropy
+
 import torch    
 
-# cost per fidelity
-def cost_fn(X):
+# cost per fidelity (batched)
+def cost_fn(X, scale):
     fidelity = X[..., -1]          # assuming last column is fidelity
-    return 1 + fidelity         # Example (you choose your own)
+
+    return fidelity * scale + 1
 
 class CostScaledLogEI(AcquisitionFunction):
-    def __init__(self, model, best_f, cost_fn, current_itr):
+    def __init__(self, model, best_f, cost_fn, cost_scale):
         super().__init__(model)
         self.log_ei = LogExpectedImprovement(model=model, best_f=best_f)
         self.cost_fn = cost_fn  # cost_fn: X -> cost
-        self.current_itr = current_itr
-        
+        self.cost_scale = cost_scale
     def forward(self, X):
         logei_val = self.log_ei(X)
-        cost = self.cost_fn(X)
+        cost = self.cost_fn(X, self.cost_scale) # shape: batch_shape
 
         return - logei_val / cost.squeeze(-1) # divide acquisition value with the cost to get improvement per cost
 
 class CostScaledUCB(AcquisitionFunction):
-    def __init__(self, model, beta, cost_fn):
+    def __init__(self, model, beta, cost_fn, cost_scale):
         super().__init__(model)
         self.ucb = UpperConfidenceBound(model=model, beta=beta)
         self.cost_fn = cost_fn  # X -> cost
+        self.cost_scale = cost_scale
 
     def forward(self, X):
         """
         X: batch_shape x q x d
         """
         ucb_val = self.ucb(X)              # shape: batch_shape
-        cost = self.cost_fn(X).squeeze(-1) # shape: batch_shape
+        cost = self.cost_fn(X, self.cost_scale).squeeze(-1) # shape: batch_shape
 
         return ucb_val / cost
 
+class CostAwarePES(AcquisitionFunction):
+    def __init__(self, model, candidate_set, cost_fn, cost_scale):
+        super().__init__(model)
+        self.pes = qMaxValueEntropy(
+            model=model,
+            candidate_set=candidate_set,
+        )
+        self.cost_fn = cost_fn
+        self.cost_scale = cost_scale
+
+    def forward(self, X):
+        pes_val = self.pes(X)  # shape: batch
+
+        # clamp to avoid log(0)
+        pes_val = pes_val.clamp_min(1e-10)
+
+        cost = self.cost_fn(X, self.cost_scale).squeeze(-1)
+        cost = cost.clamp_min(1e-6)
+
+        # log(info gain per cost)
+        return pes_val / cost
+    
 class CostScaledKG(AcquisitionFunction):
     def __init__(
         self,
@@ -44,6 +69,7 @@ class CostScaledKG(AcquisitionFunction):
         num_fantasies,
         current_max_pmean,
         sampler,
+        cost_scale
     ):
         super().__init__(model)
 
@@ -57,6 +83,7 @@ class CostScaledKG(AcquisitionFunction):
         )
 
         self.cost_fn = cost_fn
+        self.cost_scale = cost_scale
 
     def forward(self, X):
         """
@@ -68,7 +95,7 @@ class CostScaledKG(AcquisitionFunction):
 
         # Cost of the REAL point only
         real_X = X[..., :1, :]                     # batch x 1 x d
-        cost = self.cost_fn(real_X)                # batch x 1 or batch
+        cost = self.cost_fn(real_X, self.cost_scale)                # batch x 1 or batch
         cost = cost.squeeze(-1).squeeze(-1)        # batch
 
         return kg_val / cost

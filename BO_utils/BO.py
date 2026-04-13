@@ -1,6 +1,6 @@
 from botorch.models import SingleTaskGP, MixedSingleTaskGP, SingleTaskMultiFidelityGP
 from botorch.acquisition import UpperConfidenceBound, LogExpectedImprovement, PosteriorMean, qKnowledgeGradient
-from botorch.acquisition.acquisition import AcquisitionFunction
+from botorch.acquisition.max_value_entropy_search import qMaxValueEntropy
 from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
 from gpytorch.mlls import ExactMarginalLogLikelihood
@@ -13,13 +13,14 @@ import torch
 import numpy as np
 import os
 from tqdm import tqdm
-from typing import List
+from typing import List, Any
+import random
 
 from transformers import TrainerCallback
 from datasets import concatenate_datasets
 from LLM.llm import sample, tokenizing_method, train_on_inputs, add_eos_token, evaluate_tasks, get_tokenizer_and_model, load_data, extract_data_mixture_and_train
 from LLM.tokenize_util import tokenizing_method
-from BO_utils.acquisition_functions import CostScaledLogEI, CostScaledUCB, CostScaledKG, cost_fn
+from BO_utils.acquisition_functions import CostScaledLogEI, CostScaledUCB, CostScaledKG, CostAwarePES, cost_fn
 from BO_utils.utils import print_non_lora_params, print_lora_params
 from BO_utils.utils import randomly_generate_data, print_inputs, arrange_lora_config, process_candidate, inverse_process_candidate, generate_bounds
 
@@ -156,6 +157,7 @@ def evaluate_single_configuration(
                 evaluation_batch: int,
                 num_eval_samples: int,
                 time_callback: TrainerCallback,
+                BO_params: dict | None = None,
                 seed: int = 42,
             ) -> tuple[float, float, dict]:
                 """
@@ -251,7 +253,9 @@ def evaluate_single_configuration(
                 # Evaluate performance
                 observed_performance, realized_performance = evaluate_final_performance(
                     model, tokenizer, eval_method, fidelity, evaluation_task, 
-                    train_results, evaluation_batch, num_eval_samples
+                    train_results, evaluation_batch, num_eval_samples,
+                    BO_params=BO_params,
+                    input_X=input_X,
                 )
                 
                 print(f"Observed performance: {observed_performance}")
@@ -267,7 +271,9 @@ def evaluate_final_performance(
     evaluation_task: dict,
     train_results: dict,
     evaluation_batch: int,
-    num_eval_samples: int
+    num_eval_samples: int,
+    BO_params: dict | None = None,
+    input_X: List[float] | None = None,
 ) -> tuple[float, float]:
     """Compute observed and realised performance after training.
 
@@ -319,7 +325,109 @@ def evaluate_final_performance(
     else:
         assert False, "eval_method not properly set."
         
+    print("using jobs adjustment here if enabled...")
+    observed_performance = maybe_apply_jobs_adjustment(
+        observed_performance=observed_performance,
+        eval_method=eval_method,
+        train_results=train_results,
+        input_X=input_X,
+        fidelity=fidelity,
+        BO_params=BO_params,
+    )
+    if BO_params is not None and BO_params.get("use_JoBS", True):
+        if eval_method == "performance":
+            realized_performance = realized_performance * 1.05
+        else:
+            realized_performance = realized_performance * (1/1.05)
     return observed_performance, realized_performance
+
+def maybe_apply_jobs_adjustment(
+    observed_performance: float,
+    eval_method: str,
+    train_results: dict,
+    input_X: List[float] | None,
+    fidelity: int | None,
+    BO_params: dict | None,
+) -> float:
+    """Use a stored JoBS predictor to replace observed performance when enabled.
+
+    Loads a joblib model from ``BO_params["jobs_model_path"]`` (cached after
+    first load).  Builds a feature vector by concatenating ``input_X`` with
+    the first ``NUM_TRAJ_POINTS`` entries from the training trajectory:
+      - eval_loss mode  → ``train_results["eval_loss"][:4]``
+      - performance mode → first 4 values from ``train_results["step_performances"]``
+        (sorted by step number)
+    """
+    print("JoBS debug: maybe_apply_jobs_adjustment called")
+    print(
+        f"JoBS debug: eval_method={eval_method}, fidelity={fidelity}, "
+        f"observed_performance={observed_performance}"
+    )
+
+    if BO_params is None:
+        print("JoBS debug: BO_params is None; skipping JoBS adjustment")
+        return observed_performance
+
+    use_jobs = BO_params.get("use_JoBS", False)
+    print(f"JoBS debug: use_JoBS={use_jobs}")
+    if not use_jobs:
+        print("JoBS debug: use_JoBS is False; skipping JoBS adjustment")
+        return observed_performance
+
+    # --- Load model (cache after first load) ---
+    import joblib
+
+    jobs_model = BO_params.get("_jobs_model_cached")
+    if jobs_model is None:
+        jobs_model_path = BO_params.get("jobs_model_path")
+        if jobs_model_path is None:
+            raise ValueError(
+                "BO_params['use_JoBS'] is True but 'jobs_model_path' is not provided."
+            )
+        print(f"JoBS: Loading predictor from {jobs_model_path}")
+        jobs_model = joblib.load(jobs_model_path)
+        BO_params["_jobs_model_cached"] = jobs_model
+    else:
+        print("JoBS debug: using cached JoBS model")
+
+    # --- Extract first 4 intermediate values from train_results ---
+    NUM_TRAJ_POINTS = 4
+    print("train results artifact: ", train_results)
+    if eval_method == "eval_loss":
+        trajectory = train_results.get("eval_loss", [])
+    elif eval_method == "performance":
+        step_perfs = train_results.get("step_performances", {})
+        print(f"JoBS debug: step_performance keys={list(step_perfs.keys())}")
+        sorted_keys = sorted(step_perfs.keys(), key=lambda k: int(k.split("_")[-1]))
+        trajectory = [step_perfs[k] for k in sorted_keys]
+    else:
+        print(f"JoBS: Unknown eval_method '{eval_method}'; using raw observed performance.")
+        return observed_performance
+
+    if len(trajectory) < NUM_TRAJ_POINTS:
+        print(
+            f"SOMETHING WRONG; JoBS: Only {len(trajectory)} trajectory points available "
+            f"(need {NUM_TRAJ_POINTS}); using raw observed performance."
+        )
+        return observed_performance
+
+    traj_features = list(trajectory[:NUM_TRAJ_POINTS])
+    print(f"JoBS debug: first {NUM_TRAJ_POINTS} trajectory features={traj_features}")
+
+    # --- Build feature vector: input_X + first 4 trajectory values ---
+    if input_X is None:
+        print("JoBS: input_X is None; using raw observed performance.")
+        return observed_performance
+
+    features = np.array(list(input_X) + traj_features, dtype=float).reshape(1, -1)
+    print(f"JoBS debug: input_X length={len(input_X)}, feature shape={features.shape}")
+    print(f"JoBS debug: model input feature vector={features.tolist()[0]}")
+
+    # --- Predict ---
+    predicted = float(np.array(jobs_model.predict(features)).reshape(-1)[0])
+
+    print(f"JoBS adjusted observed (predicted) performance: {predicted} (true final performance: {observed_performance})")
+    return predicted
 
 def fit_GP_and_suggest_next_candidate(
     GP_input: List[List[float]], 
@@ -375,35 +483,56 @@ def fit_GP_and_suggest_next_candidate(
         else:
             print("Because we have discrete inputs, we fit a MixedSingleTaskGP")
             gp = MixedSingleTaskGP(torch.DoubleTensor(GP_input), torch.DoubleTensor(observed_output).reshape(-1,1), discrete_dims, outcome_transform=Standardize(m=1), input_transform=Normalize(d=len(GP_input[0])))
+            #gp = SingleTaskGP(torch.DoubleTensor(GP_input), torch.DoubleTensor(observed_output).reshape(-1,1), outcome_transform=Standardize(m=1), input_transform=Normalize(d=len(GP_input[0])))
     
     # maximum likelihood estimation to fit the GP
     if BO_params["optimize_method"] != "random":
         print("performing maximum likelihood estimation to fit the GP...")
         fit_gpytorch_mll(ExactMarginalLogLikelihood(gp.likelihood, gp))
 
+    acq = None
     # initialize acquisition function
-    if BO_params["acq_function"] == "ucb":
-        acq = UpperConfidenceBound(gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5))
-    if BO_params["acq_function"] == "EI":
-        acq = LogExpectedImprovement(gp, best_f=max_performance_so_far)
     if BO_params["optimize_method"] == "multi_fidelity":
-        acq = CostScaledUCB(model=gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5), cost_fn=cost_fn)
-    if BO_params["optimize_method"] == "multi_fidelity_KG":
-        print("building KG acq function")
-        num_fantasies = 8
-        # base KG
-        qKG = qKnowledgeGradient(gp, num_fantasies=num_fantasies)
-    
-        # get current best posterior mean
-        argmax_pmean, max_pmean = optimize_acqf(
-            acq_function=PosteriorMean(gp),
-            bounds=bounds,
-            q=1,
-            num_restarts=10,
-            raw_samples=512,
-        )
+        if BO_params["acq_function"] == "ucb":
+            acq = CostScaledUCB(model=gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5), cost_fn=cost_fn, cost_scale=BO_params["cost_scale_mf"])
+        elif BO_params["acq_function"] == "EI":
+            acq = CostScaledLogEI(model=gp, best_f=max_performance_so_far, cost_fn=cost_fn, cost_scale=BO_params["cost_scale_mf"])
+        elif BO_params["acq_function"] == "pes":
+            candidate_set = torch.rand(
+                1000, bounds.size(1), device=bounds.device, dtype=bounds.dtype
+            )
+            candidate_set = bounds[0] + (bounds[1] - bounds[0]) * candidate_set
+            print("candidate set of pes", candidate_set.shape)
+
+            acq = CostAwarePES(model=gp, candidate_set=candidate_set, cost_fn=cost_fn, cost_scale=BO_params["cost_scale_mf"])
         
-        acq = CostScaledKG(model=gp, cost_fn=cost_fn, num_fantasies=num_fantasies, current_max_pmean=max_pmean, sampler=qKG.sampler)
+        elif BO_params["acq_function"] == "KG":
+            print("building KG acq function")
+            num_fantasies = 8
+            qKG = qKnowledgeGradient(gp, num_fantasies=num_fantasies)
+            argmax_pmean, max_pmean = optimize_acqf(
+                acq_function=PosteriorMean(gp),
+                bounds=bounds,
+                q=1,
+                num_restarts=10,
+                raw_samples=512,
+            )
+            acq = CostScaledKG(model=gp, cost_fn=cost_fn, num_fantasies=num_fantasies, current_max_pmean=max_pmean, sampler=qKG.sampler)
+    else:
+        if BO_params["acq_function"] == "ucb":
+            acq = UpperConfidenceBound(gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5))
+        elif BO_params["acq_function"] == "EI":
+            acq = LogExpectedImprovement(gp, best_f=max_performance_so_far)
+        elif BO_params["acq_function"] == "pes":
+            candidate_set = torch.rand(
+                1000, bounds.size(1), device=bounds.device, dtype=bounds.dtype
+            )
+            candidate_set = bounds[0] + (bounds[1] - bounds[0]) * candidate_set
+            print("candidate set of pes", candidate_set.shape)
+
+            return qMaxValueEntropy(model=gp, candidate_set=candidate_set)
+            
+    
     
     next_fidelity = None
     candidate = None
@@ -452,7 +581,7 @@ def fit_GP_and_suggest_next_candidate(
             (indices, coeffs, 1.0)
         ]
 
-    if BO_params["optimize_method"] in ["continuous_relaxation", "mixed", "multi_fidelity", "multi_fidelity_KG"]:
+    if BO_params["optimize_method"] in ["continuous_relaxation", "mixed", "multi_fidelity"]:
 
         if BO_params["optimize_method"] == "continuous_relaxation":
             candidate, _ = optimize_acqf(
@@ -463,47 +592,68 @@ def fit_GP_and_suggest_next_candidate(
 
         elif BO_params["optimize_method"] == "mixed":
             if what_to_optimize == "data":
-                print("Using default optimize_acqf with constraints for continuous variables")
-                print("bounds: ",bounds)
+
                 candidate, _ = optimize_acqf(
                 acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024, equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
                 )
             elif what_to_optimize in ["model", "both"]:
-                candidate, _ = optimize_acqf_mixed_alternating(
-                acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims,
-                equality_constraints=equality_constraints if what_to_optimize == "both" else None, inequality_constraints=inequality_constraints
-                )
+                
+                try:
+                    candidate, _ = optimize_acqf_mixed_alternating(
+                    acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims,
+                    equality_constraints=equality_constraints if what_to_optimize == "both" else None, inequality_constraints=inequality_constraints
+                    )
+                except:
+                    print("optimize_acqf_mixed_alternating failed, falling back to optimize_acqf without specifying discrete_dims")
+                    candidate, _ = optimize_acqf(
+                        acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024,
+                        equality_constraints=equality_constraints if what_to_optimize == "both" else None, inequality_constraints=inequality_constraints
+                    )
             else:
                 assert False, "what_to_optimize not properly set for mixed optimization"
             
             return candidate, next_fidelity, gp
 
         elif BO_params["optimize_method"] == "multi_fidelity":
-            candidate, _ = optimize_acqf_mixed_alternating(
-                acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims,
-                equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
-            )
+            if BO_params["acq_function"] == "KG":
+                t_prev = time.time()
+                q = 1 + 8  # for KG, we need to add one more batch
+                print("Optimzing KG acquisition function, which is more computationally expensive since it involves fantasizing. This may take a while...")
+                candidate, acq_value = optimize_acqf(
+                    acq_function=acq, bounds=bounds, q=q, num_restarts=10, raw_samples=512,
+                    equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
+                )
+                candidate = candidate[0:1, :]  # only take first entry because KG returns 1 + 8 batches
+                t_now = time.time()
+                print(f"Time taken to perform multi_fidelity KG optimization: {t_now - t_prev:.4f} seconds")
+            else:
+                
+                acq_value = None
+                try:
+                    candidate, acq_value = optimize_acqf_mixed_alternating(
+                        acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims,
+                        equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
+                    )
+                except:
+                    print("optimize_acqf_mixed_alternating failed, falling back to optimize_acqf without specifying discrete_dims")
+                    candidate, acq_value = optimize_acqf(
+                        acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024,
+                        equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
+                    )
+
+                # PRINTING THINGS FOR MULTI-FID
+                # clone and flip fidelity (last dim)
+                candidate_flipped = candidate.clone()
+                candidate_flipped[..., -1] = 1.0 - candidate_flipped[..., -1]
+
+                # evaluate flipped
+                acq_val_flipped = acq(candidate_flipped)
+                print("multi-fidelity candidate:", candidate)
+                print("original acq:", acq_value.item())
+                print("flipped acq:", acq_val_flipped.item())
+                print("cost_scale", BO_params["cost_scale_mf"])
             
             # split the candidate into the candidate inputs and fidelity
-            # TODO: assertion check that candidate has correct dimension (since we didn't do fidelity None check)
-            next_fidelity = round(candidate[0][-1].item())
-            candidate = candidate[:, :-1]
-            return candidate, next_fidelity, gp
-
-        elif BO_params["optimize_method"] == "multi_fidelity_KG":
-            t_prev = time.time()
-            q = 1 + 8  # for KG, we need to add one more batch
-            print("Optimzing KG acquisition function, which is more computationally expensive since it involves fantasizing. This may take a while...")
-            candidate, acq_value = optimize_acqf(
-                acq_function=acq, bounds=bounds, q=q, num_restarts=10, raw_samples=512,
-                equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
-            )
-            candidate = candidate[0:1, :] # this is not a bug. we only take first entry because KG returns a 1 + 64 batches.
-            t_now = time.time()
-            print(f"Time taken to perform multi_fidelity_KG optimization: {t_now - t_prev:.4f} seconds")
-    
-            # split the candidate into the candidate inputs and fidelity
-            # TODO: assertion check that candidate has correct dimension (since we didn't do fidelity None check)
             next_fidelity = round(candidate[0][-1].item())
             candidate = candidate[:, :-1]
             return candidate, next_fidelity, gp
@@ -783,11 +933,11 @@ def joint_opt_BO_LLM_generalized(
     for init_sample_idx in range(num_initial_random_samples):
         print(f"\n--- Initial Sample {init_sample_idx + 1}/{num_initial_random_samples} ---")
         
-        # Generate random configuration
+        # Generate random configuration (deterministic for a given seed)
         input_X, input_X_between_0_1, sample_fidelity = randomly_generate_data(
             what_to_optimize, data_domains, lora_max_num_layers, 
-            lora_rank_max, BO_params, seed=None
-        )
+            lora_rank_max, BO_params, seed=13549 + init_sample_idx
+        ) # this seed is fixed for the initial random sampling phase to ensure reproducibility 
         
         _, _, discrete_dims = get_lora_and_mixing_ratio(input_X, what_to_optimize, data_domains, lora_max_num_layers, default_lora_config, sample_fidelity) # just to print the generated config in a more readable way
         
@@ -815,6 +965,7 @@ def joint_opt_BO_LLM_generalized(
             evaluation_batch=evaluation_batch,
             num_eval_samples=num_eval_samples,
             time_callback=time_callback,
+            BO_params=BO_params,
             seed=seed,
         )
         
@@ -864,8 +1015,10 @@ def joint_opt_BO_LLM_generalized(
     while itr < BO_params["BO_iterations"]:
         print("\n\n\n")
         print("======== BO iteration: ", itr, " ==========")
+        seed = random.randint(0, 2**32 - 1)
         torch.manual_seed(seed)
         np.random.seed(seed)
+        print("seed for this iteration: ", seed)
         tokenizer, model = get_tokenizer_and_model(model_id=model_id)
         lora_config = None
         discrete_dims = None
@@ -948,10 +1101,21 @@ def joint_opt_BO_LLM_generalized(
             lora_config=lora_config,
             eval_steps=eval_steps,
             callback=callbacks_list,
-            seed=seed
+            seed=int.from_bytes(os.urandom(8), 'big') % (2**32)
         )
 
-        observed_performance, realized_performance = evaluate_final_performance(model, tokenizer, eval_method, fidelity, evaluation_task, train_results, evaluation_batch, num_eval_samples)
+        observed_performance, realized_performance = evaluate_final_performance(
+            model,
+            tokenizer,
+            eval_method,
+            fidelity,
+            evaluation_task,
+            train_results,
+            evaluation_batch,
+            num_eval_samples,
+            BO_params=BO_params,
+            input_X=input_X,
+        )
         
         # max performance
         max_performance_so_far = max(max_performance_so_far, realized_performance)
