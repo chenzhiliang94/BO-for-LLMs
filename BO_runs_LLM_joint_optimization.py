@@ -1,5 +1,6 @@
 import random
 import json
+import glob
 from BO_utils.BO import joint_opt_BO_LLM_generalized
 import torch
 
@@ -31,6 +32,12 @@ parser.add_argument("--training_batch", help="training batch size", type=int)
 parser.add_argument("--lora_rank", help="maximum LoRA rank", type=int)
 parser.add_argument("--time_limit", help="training time limit")
 parser.add_argument("--JoBS", help="whether to apply scaling law", type=int, default=0)
+parser.add_argument(
+    "--jobs_predictor_model",
+    help="JoBS predictor model basename in trained_predictors run folder (e.g., LinearRegression, MLP_large, or auto)",
+    type=str,
+    default="LinearRegression",
+)
 
 # =========================
 # Evaluation configuration
@@ -94,6 +101,7 @@ data_cache_dir = str(args["data_cache_dir"])
 
 acq_function = str(args["acq_function"])
 optimize_method = str(args["optimize_method"])
+jobs_predictor_model = str(args["jobs_predictor_model"]).strip()
 
 # read training_domain_metrics from /home/chenzhil/maplecg_nfs/BO-for-LLMs/configuration/all_data_domains_and_metrics.json
 training_domain_metrics_path = os.path.join(os.path.dirname(__file__), "configuration", "all_data_domains_and_metrics.json")
@@ -122,6 +130,93 @@ for task, weight in zip(tasks, evaluation_weights):
 
 print("evaluation tasks and weights: ", evaluation_task)
 
+
+def resolve_jobs_model_path(
+        root_dir: str,
+        eval_tasks: list[str],
+        model_name: str,
+        eval_method: str,
+        predictor_model_name: str,
+) -> str:
+    """Resolve a task-specific JoBS predictor path from trained_predictors.
+
+    Uses the first evaluation task when multiple tasks are provided.
+        If predictor_model_name is "auto", preference order is:
+            1) LinearRegression.joblib
+            2) MLP_large.joblib
+            3) any *.joblib in the selected run directory.
+        Otherwise, resolves <predictor_model_name>.joblib in the selected run directory.
+    """
+    if len(eval_tasks) == 0:
+        raise ValueError("JoBS is enabled but no evaluation task is provided.")
+
+    selected_task = eval_tasks[0]
+    if len(eval_tasks) > 1:
+        print(
+            f"JoBS: multiple eval tasks provided {eval_tasks}; "
+            f"using first task '{selected_task}' to choose jobs_model_path."
+        )
+
+    task_dir = os.path.join(root_dir, selected_task)
+    if not os.path.isdir(task_dir):
+        raise FileNotFoundError(
+            f"JoBS: task directory not found for '{selected_task}': {task_dir}"
+        )
+
+    model_prefix = f"{model_name}_"
+    method_tag = f"eval_{eval_method}"
+    run_dirs = [
+        d for d in glob.glob(os.path.join(task_dir, "*"))
+        if os.path.isdir(d) and os.path.basename(d).startswith(model_prefix) and method_tag in os.path.basename(d)
+    ]
+
+    if len(run_dirs) == 0:
+        # Fallback to any run directory for that model/task.
+        run_dirs = [
+            d for d in glob.glob(os.path.join(task_dir, "*"))
+            if os.path.isdir(d) and os.path.basename(d).startswith(model_prefix)
+        ]
+
+    if len(run_dirs) == 0:
+        raise FileNotFoundError(
+            f"JoBS: no predictor run directory found under {task_dir} for model '{model_name}'."
+        )
+
+    # Keep deterministic choice.
+    run_dirs = sorted(run_dirs)
+    selected_run_dir = run_dirs[0]
+
+    normalized_choice = predictor_model_name.strip()
+    if normalized_choice.lower() != "auto":
+        chosen = os.path.join(selected_run_dir, f"{normalized_choice}.joblib")
+        if os.path.isfile(chosen):
+            return chosen
+        available = sorted(
+            [
+                os.path.splitext(os.path.basename(p))[0]
+                for p in glob.glob(os.path.join(selected_run_dir, "*.joblib"))
+            ]
+        )
+        raise FileNotFoundError(
+            f"JoBS: requested predictor '{normalized_choice}.joblib' not found in {selected_run_dir}. "
+            f"Available: {available}"
+        )
+
+    preferred_files = [
+        os.path.join(selected_run_dir, "LinearRegression.joblib"),
+        os.path.join(selected_run_dir, "MLP_large.joblib"),
+    ]
+    for candidate in preferred_files:
+        if os.path.isfile(candidate):
+            return candidate
+
+    any_joblib = sorted(glob.glob(os.path.join(selected_run_dir, "*.joblib")))
+    if len(any_joblib) == 0:
+        raise FileNotFoundError(
+            f"JoBS: found run directory but no .joblib predictor file in {selected_run_dir}."
+        )
+    return any_joblib[0]
+
 train_epochs = int(args["epochs"])
 training_batch = int(args["training_batch"])
 evaluation_batch = int(args["evaluation_batch"])
@@ -138,9 +233,22 @@ BO_params = {
     "use_JoBS": to_apply_joBS,
     "to_apply_joBS": to_apply_joBS,
     "BO_iterations": BO_iterations,
-    "cost_scale_mf": int(args["cost_scale_mf"]),
+    "cost_scale_mf": float(args["cost_scale_mf"]),
     "early_train_steps": int(args["early_train_steps"])
 }
+
+if to_apply_joBS:
+    predictor_root = os.path.join(os.path.dirname(__file__), "trained_predictors")
+    jobs_model_path = resolve_jobs_model_path(
+        root_dir=predictor_root,
+        eval_tasks=tasks,
+        model_name=model,
+        eval_method=eval_method,
+        predictor_model_name=jobs_predictor_model,
+    )
+    BO_params["jobs_model_path"] = jobs_model_path
+    BO_params["jobs_predictor_model"] = jobs_predictor_model
+    print(f"JoBS: using jobs_model_path={jobs_model_path}")
 
 # how to form the data mixture
 sample_method = "random"
@@ -237,10 +345,11 @@ import os
 print("final results: ", final_info_stored)
 # Combine the info you want to save
 
+serializable_bo_params = {k: v for k, v in BO_params.items() if k != "_jobs_model_cached"}
 output_data = {
     "final_info_stored": final_info_stored,
     "full_training_run_performance": full_train_performance,
-    "BO_params": BO_params,
+    "BO_params": serializable_bo_params,
     "fidelity_levels": all_fidelity_levels,
     "intermediate_results": all_intermediate_results_per_trial
 }

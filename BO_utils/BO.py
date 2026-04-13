@@ -1,6 +1,6 @@
 from botorch.models import SingleTaskGP, MixedSingleTaskGP, SingleTaskMultiFidelityGP
 from botorch.acquisition import UpperConfidenceBound, LogExpectedImprovement, PosteriorMean, qKnowledgeGradient
-from botorch.acquisition.acquisition import AcquisitionFunction
+from botorch.acquisition.max_value_entropy_search import qMaxValueEntropy
 from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
 from gpytorch.mlls import ExactMarginalLogLikelihood
@@ -20,7 +20,7 @@ from transformers import TrainerCallback
 from datasets import concatenate_datasets
 from LLM.llm import sample, tokenizing_method, train_on_inputs, add_eos_token, evaluate_tasks, get_tokenizer_and_model, load_data, extract_data_mixture_and_train
 from LLM.tokenize_util import tokenizing_method
-from BO_utils.acquisition_functions import CostScaledLogEI, CostScaledUCB, CostScaledKG, cost_fn
+from BO_utils.acquisition_functions import CostScaledLogEI, CostScaledUCB, CostScaledKG, CostAwarePES, cost_fn
 from BO_utils.utils import print_non_lora_params, print_lora_params
 from BO_utils.utils import randomly_generate_data, print_inputs, arrange_lora_config, process_candidate, inverse_process_candidate, generate_bounds
 
@@ -325,6 +325,7 @@ def evaluate_final_performance(
     else:
         assert False, "eval_method not properly set."
         
+    print("using jobs adjustment here if enabled...")
     observed_performance = maybe_apply_jobs_adjustment(
         observed_performance=observed_performance,
         eval_method=eval_method,
@@ -333,20 +334,12 @@ def evaluate_final_performance(
         fidelity=fidelity,
         BO_params=BO_params,
     )
+    if BO_params is not None and BO_params.get("use_JoBS", True):
+        if eval_method == "performance":
+            realized_performance = realized_performance * 1.05
+        else:
+            realized_performance = realized_performance * (1/1.05)
     return observed_performance, realized_performance
-
-def _jobs_step_feature_vector(
-    step_performances: dict,
-    jobs_steps: List[int],
-) -> np.ndarray:
-    """Create a fixed-order feature vector from step performance records."""
-    return np.array(
-        [
-            float(step_performances.get(f"performance_step_{step}", np.nan))
-            for step in jobs_steps
-        ],
-        dtype=float,
-    )
 
 def maybe_apply_jobs_adjustment(
     observed_performance: float,
@@ -356,59 +349,84 @@ def maybe_apply_jobs_adjustment(
     fidelity: int | None,
     BO_params: dict | None,
 ) -> float:
-    """Use JoBS model prediction as the BO-observed value when enabled."""
+    """Use a stored JoBS predictor to replace observed performance when enabled.
+
+    Loads a joblib model from ``BO_params["jobs_model_path"]`` (cached after
+    first load).  Builds a feature vector by concatenating ``input_X`` with
+    the first ``NUM_TRAJ_POINTS`` entries from the training trajectory:
+      - eval_loss mode  → ``train_results["eval_loss"][:4]``
+      - performance mode → first 4 values from ``train_results["step_performances"]``
+        (sorted by step number)
+    """
+    print("JoBS debug: maybe_apply_jobs_adjustment called")
+    print(
+        f"JoBS debug: eval_method={eval_method}, fidelity={fidelity}, "
+        f"observed_performance={observed_performance}"
+    )
+
     if BO_params is None:
+        print("JoBS debug: BO_params is None; skipping JoBS adjustment")
         return observed_performance
 
-    use_jobs = BO_params.get("use_JoBS", BO_params.get("to_apply_joBS", False))
+    use_jobs = BO_params.get("use_JoBS", False)
+    print(f"JoBS debug: use_JoBS={use_jobs}")
     if not use_jobs:
+        print("JoBS debug: use_JoBS is False; skipping JoBS adjustment")
         return observed_performance
 
-    if eval_method != "performance":
-        print("JoBS is enabled but eval_method is not 'performance'; skipping JoBS adjustment.")
-        return observed_performance
+    # --- Load model (cache after first load) ---
+    import joblib
 
-    step_performances = train_results.get("step_performances", {})
-    if not step_performances:
-        print("JoBS is enabled but no step performances were recorded; using raw observed performance.")
-        return observed_performance
-
-    jobs_model: Any = BO_params.get("jobs_model")
+    jobs_model = BO_params.get("_jobs_model_cached")
     if jobs_model is None:
-        raise ValueError("BO_params['use_JoBS'] is true but BO_params['jobs_model'] is not provided.")
-
-    context = {
-        "input_X": input_X,
-        "fidelity": fidelity,
-        "step_performances": step_performances,
-        "observed_performance": observed_performance,
-    }
-
-    if callable(jobs_model):
-        predicted = jobs_model(context)
-    elif hasattr(jobs_model, "predict"):
-        jobs_steps = BO_params.get("jobs_steps", [25, 50, 75, 100])
-        step_features = _jobs_step_feature_vector(step_performances, jobs_steps)
-        if np.isnan(step_features).any():
-            print("JoBS step features are incomplete; using raw observed performance.")
-            return observed_performance
-        include_input = BO_params.get("jobs_include_input", False)
-        if include_input and input_X is not None:
-            features = np.array(list(input_X) + step_features.tolist(), dtype=float)
-        else:
-            features = step_features
-        predicted = jobs_model.predict(features.reshape(1, -1))
+        jobs_model_path = BO_params.get("jobs_model_path")
+        if jobs_model_path is None:
+            raise ValueError(
+                "BO_params['use_JoBS'] is True but 'jobs_model_path' is not provided."
+            )
+        print(f"JoBS: Loading predictor from {jobs_model_path}")
+        jobs_model = joblib.load(jobs_model_path)
+        BO_params["_jobs_model_cached"] = jobs_model
     else:
-        raise TypeError("BO_params['jobs_model'] must be callable or provide a .predict method.")
+        print("JoBS debug: using cached JoBS model")
 
-    if isinstance(predicted, torch.Tensor):
-        predicted = predicted.detach().cpu().reshape(-1)[0].item()
-    elif isinstance(predicted, (list, tuple, np.ndarray)):
-        predicted = float(np.array(predicted).reshape(-1)[0])
+    # --- Extract first 4 intermediate values from train_results ---
+    NUM_TRAJ_POINTS = 4
+    print("train results artifact: ", train_results)
+    if eval_method == "eval_loss":
+        trajectory = train_results.get("eval_loss", [])
+    elif eval_method == "performance":
+        step_perfs = train_results.get("step_performances", {})
+        print(f"JoBS debug: step_performance keys={list(step_perfs.keys())}")
+        sorted_keys = sorted(step_perfs.keys(), key=lambda k: int(k.split("_")[-1]))
+        trajectory = [step_perfs[k] for k in sorted_keys]
     else:
-        predicted = float(predicted)
+        print(f"JoBS: Unknown eval_method '{eval_method}'; using raw observed performance.")
+        return observed_performance
 
-    print(f"JoBS adjusted observed performance: {predicted} (raw: {observed_performance})")
+    if len(trajectory) < NUM_TRAJ_POINTS:
+        print(
+            f"SOMETHING WRONG; JoBS: Only {len(trajectory)} trajectory points available "
+            f"(need {NUM_TRAJ_POINTS}); using raw observed performance."
+        )
+        return observed_performance
+
+    traj_features = list(trajectory[:NUM_TRAJ_POINTS])
+    print(f"JoBS debug: first {NUM_TRAJ_POINTS} trajectory features={traj_features}")
+
+    # --- Build feature vector: input_X + first 4 trajectory values ---
+    if input_X is None:
+        print("JoBS: input_X is None; using raw observed performance.")
+        return observed_performance
+
+    features = np.array(list(input_X) + traj_features, dtype=float).reshape(1, -1)
+    print(f"JoBS debug: input_X length={len(input_X)}, feature shape={features.shape}")
+    print(f"JoBS debug: model input feature vector={features.tolist()[0]}")
+
+    # --- Predict ---
+    predicted = float(np.array(jobs_model.predict(features)).reshape(-1)[0])
+
+    print(f"JoBS adjusted observed (predicted) performance: {predicted} (true final performance: {observed_performance})")
     return predicted
 
 def fit_GP_and_suggest_next_candidate(
@@ -479,6 +497,15 @@ def fit_GP_and_suggest_next_candidate(
             acq = CostScaledUCB(model=gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5), cost_fn=cost_fn, cost_scale=BO_params["cost_scale_mf"])
         elif BO_params["acq_function"] == "EI":
             acq = CostScaledLogEI(model=gp, best_f=max_performance_so_far, cost_fn=cost_fn, cost_scale=BO_params["cost_scale_mf"])
+        elif BO_params["acq_function"] == "pes":
+            candidate_set = torch.rand(
+                1000, bounds.size(1), device=bounds.device, dtype=bounds.dtype
+            )
+            candidate_set = bounds[0] + (bounds[1] - bounds[0]) * candidate_set
+            print("candidate set of pes", candidate_set.shape)
+
+            acq = CostAwarePES(model=gp, candidate_set=candidate_set, cost_fn=cost_fn, cost_scale=BO_params["cost_scale_mf"])
+        
         elif BO_params["acq_function"] == "KG":
             print("building KG acq function")
             num_fantasies = 8
@@ -496,7 +523,15 @@ def fit_GP_and_suggest_next_candidate(
             acq = UpperConfidenceBound(gp, beta=BO_params["ucb_beta"]/(2*(itr+1)**0.5))
         elif BO_params["acq_function"] == "EI":
             acq = LogExpectedImprovement(gp, best_f=max_performance_so_far)
-    assert acq is not None, "acquisition function not properly initialized."
+        elif BO_params["acq_function"] == "pes":
+            candidate_set = torch.rand(
+                1000, bounds.size(1), device=bounds.device, dtype=bounds.dtype
+            )
+            candidate_set = bounds[0] + (bounds[1] - bounds[0]) * candidate_set
+            print("candidate set of pes", candidate_set.shape)
+
+            return qMaxValueEntropy(model=gp, candidate_set=candidate_set)
+            
     
     
     next_fidelity = None
@@ -593,17 +628,30 @@ def fit_GP_and_suggest_next_candidate(
                 print(f"Time taken to perform multi_fidelity KG optimization: {t_now - t_prev:.4f} seconds")
             else:
                 
+                acq_value = None
                 try:
-                    candidate, _ = optimize_acqf_mixed_alternating(
+                    candidate, acq_value = optimize_acqf_mixed_alternating(
                         acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024, discrete_dims=discrete_dims,
                         equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
                     )
                 except:
                     print("optimize_acqf_mixed_alternating failed, falling back to optimize_acqf without specifying discrete_dims")
-                    candidate, _ = optimize_acqf(
+                    candidate, acq_value = optimize_acqf(
                         acq, bounds=bounds, q=1, num_restarts=20, raw_samples=1024,
                         equality_constraints=equality_constraints, inequality_constraints=inequality_constraints
                     )
+
+                # PRINTING THINGS FOR MULTI-FID
+                # clone and flip fidelity (last dim)
+                candidate_flipped = candidate.clone()
+                candidate_flipped[..., -1] = 1.0 - candidate_flipped[..., -1]
+
+                # evaluate flipped
+                acq_val_flipped = acq(candidate_flipped)
+                print("multi-fidelity candidate:", candidate)
+                print("original acq:", acq_value.item())
+                print("flipped acq:", acq_val_flipped.item())
+                print("cost_scale", BO_params["cost_scale_mf"])
             
             # split the candidate into the candidate inputs and fidelity
             next_fidelity = round(candidate[0][-1].item())

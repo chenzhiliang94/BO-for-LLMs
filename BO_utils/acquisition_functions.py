@@ -1,13 +1,15 @@
 from botorch.acquisition import AcquisitionFunction
 from botorch.acquisition.knowledge_gradient import qKnowledgeGradient
 from botorch.acquisition.analytic import LogExpectedImprovement, UpperConfidenceBound, PosteriorMean
+from botorch.acquisition.max_value_entropy_search import qMaxValueEntropy
+
 import torch    
 
 # cost per fidelity (batched)
 def cost_fn(X, scale):
     fidelity = X[..., -1]          # assuming last column is fidelity
 
-    return (fidelity + 1) * scale
+    return fidelity * scale + 1
 
 class CostScaledLogEI(AcquisitionFunction):
     def __init__(self, model, best_f, cost_fn, cost_scale):
@@ -37,6 +39,28 @@ class CostScaledUCB(AcquisitionFunction):
 
         return ucb_val / cost
 
+class CostAwarePES(AcquisitionFunction):
+    def __init__(self, model, candidate_set, cost_fn, cost_scale):
+        super().__init__(model)
+        self.pes = qMaxValueEntropy(
+            model=model,
+            candidate_set=candidate_set,
+        )
+        self.cost_fn = cost_fn
+        self.cost_scale = cost_scale
+
+    def forward(self, X):
+        pes_val = self.pes(X)  # shape: batch
+
+        # clamp to avoid log(0)
+        pes_val = pes_val.clamp_min(1e-10)
+
+        cost = self.cost_fn(X, self.cost_scale).squeeze(-1)
+        cost = cost.clamp_min(1e-6)
+
+        # log(info gain per cost)
+        return pes_val / cost
+    
 class CostScaledKG(AcquisitionFunction):
     def __init__(
         self,
