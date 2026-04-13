@@ -1,7 +1,7 @@
 #!/bin/bash
 
 export TQDM_DISABLE=1
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=7
 
 # ----------------------- #
 # Shared configuration
@@ -11,7 +11,7 @@ NUM_DATA=10000
 EPOCHS=1
 TRIALS=2
 EXP_SETTING=in_dist
-TIME_LIMIT=100
+TIME_LIMIT=1000
 LORA_RANK=128
 NUM_EVAL_SAMPLES=200
 TRAIN_BATCH=36
@@ -19,6 +19,8 @@ EVAL_BATCH=36
 RESULTS_ROOT=results
 PRINTOUT_DIR=printouts
 USE_JOBS=0
+# Representative JoBS predictors to sweep.
+JOBS_PREDICTOR_MODELS=()
 UCB_BETA=20
 COST_SCALE_MF=1
 NUM_INITIAL_RANDOM_SAMPLES=10
@@ -27,7 +29,7 @@ NUM_INITIAL_RANDOM_SAMPLES=10
 # Sweep variables
 # ----------------------- #
 OPT_METHODS=("mixed")
-ACQ_FUNCS=("ucb")
+ACQ_FUNCS=("pes")
 EVAL_METHODS=("eval_loss")
 RUN_BO_ON_OPTIONS=("both")
 MODELS=("llama-8b")
@@ -35,6 +37,7 @@ TRAINING_TASKS_OPTIONS=("truthfulqa_gen,commonsense_qa,mmlu,triviaqa,gsm8k,arc_c
 
 # evaluation tasks
 TASKS=( "triviaqa" "arc_challenge" "commonsense_qa" "mmlu" "truthfulqa_gen" "gsm8k")
+
 
 # Track failures
 FAILED_JOBS=()
@@ -56,6 +59,7 @@ run_job() {
     local run_bo_on=$5
     local model=$6
     local training_tasks=$7
+    local jobs_predictor_model=$8
     local seed=12345
 
     # Output dir based on what BO optimizes: results_both, results_model, results_data
@@ -66,8 +70,13 @@ run_job() {
     local log_dir="${PRINTOUT_DIR}/${run_bo_on}"
     mkdir -p "$log_dir"
 
-    SAVE_NAME="${model}_${acq_func}_${opt_method}_eval_${eval_method}_seed_${seed}.json"
-    LOG_FILE="${log_dir}/${model}_${acq_func}_${task}_${opt_method}_eval_${eval_method}_seed_${seed}.out"
+    local jobs_suffix=""
+    if [ "$USE_JOBS" -eq 1 ]; then
+        jobs_suffix="_jobs_${jobs_predictor_model}"
+    fi
+
+    SAVE_NAME="${model}_${acq_func}_${opt_method}_eval_${eval_method}${jobs_suffix}_seed_${seed}.json"
+    LOG_FILE="${log_dir}/${model}_${acq_func}_${task}_${opt_method}_eval_${eval_method}${jobs_suffix}_seed_${seed}.out"
 
     # Skip if results file already exists
     if [ -f "${output_dir}/${task//,/_}/${SAVE_NAME}" ]; then
@@ -84,6 +93,8 @@ run_job() {
     echo "OPT_METHOD=$opt_method"
     echo "ACQ_FUNC=$acq_func"
     echo "EVAL_METHOD=$eval_method"
+    echo "JOBS_PREDICTOR_MODEL=$jobs_predictor_model"
+    echo "USE_JOBS=$USE_JOBS"
     echo "NUM_INITIAL_RANDOM_SAMPLES=$NUM_INITIAL_RANDOM_SAMPLES"
     echo "OUTPUT AT ${LOG_FILE}"
     echo "RESULTS WILL BE SAVED AT ${output_dir}/${task//,/_}/${SAVE_NAME}"
@@ -108,6 +119,7 @@ run_job() {
         --acq_function=$acq_func \
         --model=$model \
         --JoBS=$USE_JOBS \
+        --jobs_predictor_model=$jobs_predictor_model \
         --ucb_beta=$UCB_BETA \
         --cost_scale_mf=$COST_SCALE_MF \
         --optimize_method=$opt_method \
@@ -141,9 +153,10 @@ echo "ACQ_FUNCS: ${ACQ_FUNCS[*]}"
 echo "EVAL_METHODS: ${EVAL_METHODS[*]}"
 echo "RUN_BO_ON: ${RUN_BO_ON_OPTIONS[*]}"
 echo "MODELS: ${MODELS[*]}"
+echo "JOBS_PREDICTOR_MODELS: ${JOBS_PREDICTOR_MODELS[*]}"
 echo "TRAINING_TASKS: ${TRAINING_TASKS_OPTIONS[*]}"
 echo "EVAL_TASKS: ${TASKS[*]}"
-echo "ITERATIONS: $ITER | TRIALS: $TRIALS | SEED: 13549"
+echo "ITERATIONS: $ITER | TRIALS: $TRIALS | SEED: $seed | NUM_INITIAL_RANDOM_SAMPLES: $NUM_INITIAL_RANDOM_SAMPLES"
 echo "==============================================="
 echo ""
 
@@ -154,7 +167,13 @@ for model in "${MODELS[@]}"; do
                 for opt_method in "${OPT_METHODS[@]}"; do
                     for acq_func in "${ACQ_FUNCS[@]}"; do
                         for eval_method in "${EVAL_METHODS[@]}"; do
-                            run_job "$task" "$opt_method" "$acq_func" "$eval_method" "$run_bo_on" "$model" "$training_tasks"
+                            if [ "$USE_JOBS" -eq 1 ]; then
+                                for jobs_predictor_model in "${JOBS_PREDICTOR_MODELS[@]}"; do
+                                    run_job "$task" "$opt_method" "$acq_func" "$eval_method" "$run_bo_on" "$model" "$training_tasks" "$jobs_predictor_model"
+                                done
+                            else
+                                run_job "$task" "$opt_method" "$acq_func" "$eval_method" "$run_bo_on" "$model" "$training_tasks" ""
+                            fi
                         done
                     done
                 done
